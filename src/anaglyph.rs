@@ -17,14 +17,7 @@ const HALF_COLOR_MATRIX: [[f32; 9]; 2] = [ [ 0.299, 0.587, 0.114, 0.0, 0.0, 0.0,
 
 
 
-
-
-pub fn hi() -> String {
-    "HI".to_owned()
-}
-
 pub fn left_right_to_anaglyph(left_image: RgbImage, right_image: RgbImage, anaglyph_type: AnaglyphType) -> RgbImage {
-    println!("{:?}", anaglyph_type);
     if left_image.height() != right_image.height() || left_image.width() != right_image.width() {
         panic!("Left and right images must be same size")
     }
@@ -48,7 +41,7 @@ pub fn left_right_to_anaglyph(left_image: RgbImage, right_image: RgbImage, anagl
 }
 
 
-pub fn combine_slices(left: &[u8], right: &[u8], anaglyph: &mut [u8], anaglyph_type: &AnaglyphType) {
+fn combine_slices(left: &[u8], right: &[u8], anaglyph: &mut [u8], anaglyph_type: &AnaglyphType) {
     let m: &[[f32; 9]; 2] = match anaglyph_type {
         AnaglyphType::True => &TRUE_MATRIX,
         AnaglyphType::GrayScale => &GRAY_SCALE_MATRIX,
