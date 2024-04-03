@@ -9,15 +9,62 @@ pub enum AnaglyphType {
     HalfColor,
 }
 
+pub struct Offset {
+    pub x: i32,
+    pub y: i32
+}
+
 const TRUE_MATRIX: [[f32; 9]; 2] = [ [ 0.299, 0.587, 0.114, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], [ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.299, 0.587, 0.114 ] ];
 const GRAY_SCALE_MATRIX: [[f32; 9]; 2] = [ [ 0.299, 0.587, 0.114, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], [ 0.0, 0.0, 0.0, 0.299, 0.587, 0.114, 0.299, 0.587, 0.114 ] ];
 const OPTIMIZED_MATRIX: [[f32; 9]; 2] = [ [ 0.0, 0.7, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], [ 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 ] ];
 const COLOR_MATRIX: [[f32; 9]; 2] = [ [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], [ 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 ] ];
 const HALF_COLOR_MATRIX: [[f32; 9]; 2] = [ [ 0.299, 0.587, 0.114, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], [ 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 ] ];
 
+pub fn left_right_to_anaglyph_offset(left_image: &RgbImage, right_image: &RgbImage, anaglyph_type: AnaglyphType, offset: Offset) -> RgbImage {
+    if left_image.height() != right_image.height() || left_image.width() != right_image.width() {
+        panic!("Left and right images must be same size")
+    }
+    let new_height = match offset.y.abs() as u32 {
+        i if i >= left_image.height() => panic!("Y offset cannot be greater than height"),
+        i => left_image.height() - i
+    };
+    let new_width = match offset.x.abs() as u32 {
+        i if i >= left_image.width() => panic!("X offset cannot be greater than width"),
+        i => left_image.width() - i
+    };
 
+    let mut anaglyph = RgbImage::new(new_width, new_height);
 
-pub fn left_right_to_anaglyph(left_image: RgbImage, right_image: RgbImage, anaglyph_type: AnaglyphType) -> RgbImage {
+    let left_x_offset = match offset.x {
+        i if i >= 0 => i as u32,
+        _ => 0
+    };
+    let left_y_offset = match offset.y {
+        i if i >= 0 => i as u32,
+        _ => 0
+    };
+    let right_x_offset = match offset.x {
+        i if i < 0 => i.abs() as u32,
+        _ => 0
+    };
+    let right_y_offset = match offset.y {
+        i if i < 0 => i.abs() as u32,
+        _ => 0
+    };
+
+    for x in 0..new_width {
+        for y in 0..new_height {
+            let left_slice = left_image.get_pixel(x + left_x_offset, y + left_y_offset).channels();
+            let right_slice = right_image.get_pixel(x + right_x_offset, y + right_y_offset).channels();
+            let anaglyph_slice = anaglyph.get_pixel_mut(x, y).channels_mut();
+            combine_slices(left_slice, right_slice, anaglyph_slice, &anaglyph_type)
+        }
+    }
+
+    anaglyph
+}
+
+pub fn left_right_to_anaglyph(left_image: &RgbImage, right_image: &RgbImage, anaglyph_type: AnaglyphType) -> RgbImage {
     if left_image.height() != right_image.height() || left_image.width() != right_image.width() {
         panic!("Left and right images must be same size")
     }
