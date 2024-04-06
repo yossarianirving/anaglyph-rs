@@ -88,7 +88,7 @@ pub fn left_right_to_anaglyph(left_image: &RgbImage, right_image: &RgbImage, ana
 }
 
 
-fn combine_slices(left: &[u8], right: &[u8], anaglyph: &mut [u8], anaglyph_type: &AnaglyphType) {
+pub fn combine_slices(left: &[u8], right: &[u8], anaglyph: &mut [u8], anaglyph_type: &AnaglyphType) {
     let m: &[[f32; 9]; 2] = match anaglyph_type {
         AnaglyphType::True => &TRUE_MATRIX,
         AnaglyphType::GrayScale => &GRAY_SCALE_MATRIX,

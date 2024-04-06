@@ -1,5 +1,5 @@
 
-use anaglyph_rs::anaglyph::{left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset};
+use anaglyph_rs::{anaglyph::{left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset}, video};
 use clap::Parser;
 use image::{imageops, io::Reader as ImageReader, DynamicImage, RgbImage};
 
@@ -19,7 +19,13 @@ struct Args {
     #[arg(long)]
     offset_x: Option<i32>,
     #[arg(long)]
-    offset_y: Option<i32>
+    offset_y: Option<i32>,
+    #[arg(long)]
+    video: Option<String>,
+    #[arg(long)]
+    video_direction: Option<String>,
+    #[arg(long)]
+    video_out: Option<String>
 }
 
 fn main() {
@@ -33,28 +39,29 @@ fn main() {
         Some(_) | None => AnaglyphType::Color
 
     };
-    let offset = match (args.offset_x, args.offset_y) {
-        (Some(x), Some(y)) => Some(Offset { x , y }),
-        _ => None
-    };
-    let anaglyph: DynamicImage = match args {
-        Args { left: Some(left), right: Some(right), ..} => convert_left_right(left, right, anaglyph_type, offset),
-        Args { stereo: Some(stereo), ..} => convert_stereoscopic(stereo, anaglyph_type, offset),
-        Args {..} => {
-            println!("Nothing!!!");
-            DynamicImage::new(0, 0, image::ColorType::Rgb8)
-        } 
-    };
+    // let offset = match (args.offset_x, args.offset_y) {
+    //     (Some(x), Some(y)) => Some(Offset { x , y }),
+    //     _ => None
+    // };
+    // let anaglyph: DynamicImage = match args {
+    //     Args { left: Some(left), right: Some(right), ..} => convert_left_right(left, right, anaglyph_type, offset),
+    //     Args { stereo: Some(stereo), ..} => convert_stereoscopic(stereo, anaglyph_type, offset),
+    //     Args {..} => {
+    //         println!("Nothing!!!");
+    //         DynamicImage::new(0, 0, image::ColorType::Rgb8)
+    //     } 
+    // };
 
 
-    let output_name = match args.out {
-        Some(name) => name,
-        None => "output.jpg".to_owned()
-    };
-    match anaglyph.save(output_name) {
-        Ok(_) => println!(""),
-        Err(i) => panic!("{}", i)
-    };
+    // let output_name = match args.out {
+    //     Some(name) => name,
+    //     None => "output.jpg".to_owned()
+    // };
+    // match anaglyph.save(output_name) {
+    //     Ok(_) => println!(""),
+    //     Err(i) => panic!("{}", i)
+    // };
+    video::convert_video_to_anaglyph(args.video.as_ref().unwrap(), args.video_out.as_ref().unwrap(), video::VideoDirection::Clockwise);
 }
 
 // convert left/right into anaglpyh
