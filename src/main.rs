@@ -1,79 +1,99 @@
-
-use anaglyph_rs::{anaglyph::{left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset}, video};
-use clap::Parser;
+use anaglyph_rs::{
+    anaglyph::{left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset},
+    video,
+};
+use clap::{arg, command, value_parser, ArgAction, Command};
 use image::{imageops, io::Reader as ImageReader, DynamicImage, RgbImage};
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    #[arg(short, long)]
-    left: Option<String>,
-    #[arg(short, long)]
-    right: Option<String>,
-    #[arg(short, long)]
-    stereo: Option<String>,
-    #[arg(short, long)]
-    out: Option<String>,
-    #[arg(short)]
-    t: Option<String>,
-    #[arg(long)]
-    offset_x: Option<i32>,
-    #[arg(long)]
-    offset_y: Option<i32>,
-    #[arg(long)]
-    video: Option<String>,
-    #[arg(long)]
-    video_direction: Option<String>,
-    #[arg(long)]
-    video_out: Option<String>
-}
-
 fn main() {
-    let args = Args::parse();
-    let anaglyph_type = match args.t.as_deref() {
-        Some("color") => AnaglyphType::Color,
-        Some("half-color") => AnaglyphType::HalfColor,
-        Some("grayscale") => AnaglyphType::GrayScale,
-        Some("optimized") => AnaglyphType::Optimized,
-        Some("true") => AnaglyphType::True,
-        Some(_) | None => AnaglyphType::Color
+    let matches = command!()
+        .arg(arg!(-l --left <FILE> "Left image").required(false))
+        .arg(arg!(-r --right <FILE> "Right image").required(false))
+        .arg(arg!(-s --stereo <FILE> "Stereoscopic image").required(false))
+        .arg(arg!(-o --out <FILE> "Output file").required(true))
+        .arg(arg!(-t --type <TYPE> "Type of anaglyph").required(false).value_parser(["color", "half-color", "grayscale", "optimized", "true"]).default_value("color"))
+        .arg(arg!(-x --"offset-x" <OFFSET> "Offset in x direction (images only)").required(false).allow_negative_numbers(true).value_parser(value_parser!(i32)).default_value("0"))
+        .arg(arg!(-y --"offset-y" <OFFSET> "Offset in y direction (images only)").required(false).allow_negative_numbers(true).value_parser(value_parser!(i32)).default_value("0"))
+        .arg(arg!(-v --video <FILE> "Video file").required(false))
+        .arg(arg!(-d --"video-direction" <DIRECTION> "Direction of video (clockwise or counter-clockwise)").required(false).value_parser(["clockwise", "counter-clockwise"]).default_value("clockwise"))
+        .get_matches();
 
+    let anaglyph_type = match matches
+        .get_one::<String>("type")
+        .expect("Type should not be empty")
+        .as_str()
+    {
+        "color" => AnaglyphType::Color,
+        "half-color" => AnaglyphType::HalfColor,
+        "grayscale" => AnaglyphType::GrayScale,
+        "optimized" => AnaglyphType::Optimized,
+        "true" => AnaglyphType::True,
+        _ => panic!("Invalid anaglyph type"),
     };
-    // let offset = match (args.offset_x, args.offset_y) {
-    //     (Some(x), Some(y)) => Some(Offset { x , y }),
-    //     _ => None
-    // };
-    // let anaglyph: DynamicImage = match args {
-    //     Args { left: Some(left), right: Some(right), ..} => convert_left_right(left, right, anaglyph_type, offset),
-    //     Args { stereo: Some(stereo), ..} => convert_stereoscopic(stereo, anaglyph_type, offset),
-    //     Args {..} => {
-    //         println!("Nothing!!!");
-    //         DynamicImage::new(0, 0, image::ColorType::Rgb8)
-    //     } 
-    // };
+    let offset = Offset {
+        x: matches.get_one::<i32>("offset-x").unwrap().clone(),
+        y: matches.get_one::<i32>("offset-y").unwrap().clone(),
+    };
+    let (left, right, stereo, video) = (
+        matches.get_one::<String>("left"),
+        matches.get_one::<String>("right"),
+        matches.get_one::<String>("stereo"),
+        matches.get_one::<String>("video"),
+    );
+
+    let output = matches
+        .get_one::<String>("out")
+        .expect("Output should not be empty");
 
 
-    // let output_name = match args.out {
-    //     Some(name) => name,
-    //     None => "output.jpg".to_owned()
-    // };
-    // match anaglyph.save(output_name) {
-    //     Ok(_) => println!(""),
-    //     Err(i) => panic!("{}", i)
-    // };
-    video::convert_video_to_anaglyph(args.video.as_ref().unwrap(), args.video_out.as_ref().unwrap(), video::VideoDirection::Clockwise);
+    match (left, right, stereo, video) {
+        (Some(l), Some(r), None, None) => {
+            let anaglyph =
+                convert_left_right(l.to_string(), r.to_string(), anaglyph_type, Some(offset));
+            match anaglyph.save(output) {
+                Ok(_) => println!(""),
+                Err(i) => panic!("{}", i),
+            };
+        }
+        (None, None, Some(s), None) => {
+            let anaglyph = convert_stereoscopic(s.to_string(), anaglyph_type, Some(offset));
+            match anaglyph.save(output) {
+                Ok(_) => println!(""),
+                Err(i) => panic!("{}", i),
+            };
+        }
+        (None, None, None, Some(v)) => {
+            let direction = match matches
+                .get_one::<String>("video-direction")
+                .expect("Direction should not be empty")
+                .as_str()
+            {
+                "clockwise" => video::VideoDirection::Clockwise,
+                "counter-clockwise" => video::VideoDirection::CounterClockwise,
+                _ => panic!("Invalid video direction"),
+            };
+            video::convert_video_to_anaglyph(v, output, direction);
+        }
+        _ => panic!("No or invalid input provided"),
+    }
+
 }
 
 // convert left/right into anaglpyh
-fn convert_left_right(left: String, right: String, anaglyph_type: AnaglyphType, offset: Option<Offset>) -> DynamicImage {
+fn convert_left_right(
+    left: String,
+    right: String,
+    anaglyph_type: AnaglyphType,
+    offset: Option<Offset>,
+) -> DynamicImage {
     let left_image: RgbImage = match ImageReader::open(left) {
         Ok(r) => r.decode().unwrap().into_rgb8(), // clunky
-        Err(e) => panic!("{}", e)
+        Err(e) => panic!("{}", e),
     };
 
     let right_image: RgbImage = match ImageReader::open(right) {
         Ok(r) => r.decode().unwrap().into_rgb8(),
-        Err(e) => panic!("{}", e)
+        Err(e) => panic!("{}", e),
     };
 
     if left_image.height() != right_image.height() || left_image.width() != right_image.width() {
@@ -81,19 +101,32 @@ fn convert_left_right(left: String, right: String, anaglyph_type: AnaglyphType, 
     }
 
     match offset {
-        Some(i) => image::DynamicImage::ImageRgb8(left_right_to_anaglyph_offset(&left_image, &right_image, anaglyph_type, i)),
-        None => image::DynamicImage::ImageRgb8(left_right_to_anaglyph(&left_image, &right_image, anaglyph_type))
+        Some(i) => image::DynamicImage::ImageRgb8(left_right_to_anaglyph_offset(
+            &left_image,
+            &right_image,
+            anaglyph_type,
+            i,
+        )),
+        None => image::DynamicImage::ImageRgb8(left_right_to_anaglyph(
+            &left_image,
+            &right_image,
+            anaglyph_type,
+        )),
     }
 }
 // convert stereoscopic into anaglyph
-fn convert_stereoscopic(stereoscopic: String, anaglyph_type: AnaglyphType, offset: Option<Offset>) -> DynamicImage {
+fn convert_stereoscopic(
+    stereoscopic: String,
+    anaglyph_type: AnaglyphType,
+    offset: Option<Offset>,
+) -> DynamicImage {
     let stereoscopic_image: RgbImage = match ImageReader::open(stereoscopic) {
         Ok(r) => r.decode().unwrap().into_rgb8(),
-        Err(e) => panic!("{}", e)
+        Err(e) => panic!("{}", e),
     };
     let width = match stereoscopic_image.width() {
         w if w % 2 == 0 => w / 2,
-        _ => panic!("Stereoscopic image must have an even width")
+        _ => panic!("Stereoscopic image must have an even width"),
     };
     let height = stereoscopic_image.height();
 
@@ -101,9 +134,17 @@ fn convert_stereoscopic(stereoscopic: String, anaglyph_type: AnaglyphType, offse
 
     let right_image = imageops::crop_imm(&stereoscopic_image, width, 0, width, height).to_image();
 
-
     match offset {
-        Some(i) => image::DynamicImage::ImageRgb8(left_right_to_anaglyph_offset(&left_image, &right_image, anaglyph_type, i)),
-        None => image::DynamicImage::ImageRgb8(left_right_to_anaglyph(&left_image, &right_image, anaglyph_type))
+        Some(i) => image::DynamicImage::ImageRgb8(left_right_to_anaglyph_offset(
+            &left_image,
+            &right_image,
+            anaglyph_type,
+            i,
+        )),
+        None => image::DynamicImage::ImageRgb8(left_right_to_anaglyph(
+            &left_image,
+            &right_image,
+            anaglyph_type,
+        )),
     }
 }
