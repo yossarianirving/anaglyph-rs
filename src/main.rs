@@ -2,7 +2,7 @@ use anaglyph_rs::{
     anaglyph::{left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset},
     video,
 };
-use clap::{arg, command, value_parser, ArgAction, Command};
+use clap::{arg, command, value_parser};
 use image::{imageops, io::Reader as ImageReader, DynamicImage, RgbImage};
 
 fn main() {
@@ -49,7 +49,7 @@ fn main() {
     match (left, right, stereo, video) {
         (Some(l), Some(r), None, None) => {
             let anaglyph =
-                convert_left_right(l.to_string(), r.to_string(), anaglyph_type, Some(offset));
+                convert_left_right(l, r, anaglyph_type, Some(offset));
             match anaglyph.save(output) {
                 Ok(_) => println!(""),
                 Err(i) => panic!("{}", i),
@@ -72,7 +72,7 @@ fn main() {
                 "counter-clockwise" => video::VideoDirection::CounterClockwise,
                 _ => panic!("Invalid video direction"),
             };
-            video::convert_video_to_anaglyph(v, output, direction);
+            video::convert_video_to_anaglyph(v, output, direction, anaglyph_type);
         }
         _ => panic!("No or invalid input provided"),
     }
@@ -81,8 +81,8 @@ fn main() {
 
 // convert left/right into anaglpyh
 fn convert_left_right(
-    left: String,
-    right: String,
+    left: &String,
+    right: &String,
     anaglyph_type: AnaglyphType,
     offset: Option<Offset>,
 ) -> DynamicImage {

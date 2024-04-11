@@ -14,7 +14,7 @@ pub enum VideoDirection {
     CounterClockwise,
 }
 
-pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoDirection) {
+pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoDirection, anaglyph_type: anaglyph::AnaglyphType) {
     video_rs::init().unwrap();
     let mut decoder = match Decoder::new(Path::new(video)) {
         Ok(decoder) => decoder,
@@ -23,6 +23,7 @@ pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoD
             return;
         }
     };
+
 
     let video_size = decoder.size();
     let encoder_settings =
@@ -72,7 +73,7 @@ pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoD
                                 (left, right)
                             }
                         };
-                        let mut new_slice = new_frame
+                        let new_slice = new_frame
                             .slice_mut(ndarray::s![j, i, ..])
                             .into_slice()
                             .unwrap();
@@ -80,7 +81,7 @@ pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoD
                             left_slice,
                             right_slice,
                             new_slice,
-                            &anaglyph::AnaglyphType::Color,
+                            &anaglyph_type,
                         )
                     }
                 }
@@ -95,7 +96,7 @@ pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoD
     });
 
     for recieved in rx {
-        encoder.encode(&recieved.1, &recieved.0);
+        let _ = encoder.encode(&recieved.1, &recieved.0);
     }
 
     encoder.finish().expect("failed to finish encoder");
