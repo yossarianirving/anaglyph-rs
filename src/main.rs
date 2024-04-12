@@ -1,7 +1,8 @@
-use anaglyph_rs::{
-    anaglyph::{left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset},
-    video,
+use anaglyph_rs::anaglyph::{
+    left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset,
 };
+#[cfg(feature = "video")]
+use anaglyph_rs::video;
 use clap::{arg, command, value_parser};
 use image::{imageops, io::Reader as ImageReader, DynamicImage, RgbImage};
 
@@ -45,7 +46,6 @@ fn main() {
         .get_one::<String>("out")
         .expect("Output should not be empty");
 
-
     match (left, right, stereo, video) {
         (Some(l), Some(r), None, None) => {
             let anaglyph =
@@ -62,6 +62,7 @@ fn main() {
                 Err(i) => panic!("{}", i),
             };
         }
+        #[cfg(feature = "video")]
         (None, None, None, Some(v)) => {
             let direction = match matches
                 .get_one::<String>("video-direction")
@@ -72,11 +73,12 @@ fn main() {
                 "counter-clockwise" => video::VideoDirection::CounterClockwise,
                 _ => panic!("Invalid video direction"),
             };
-            video::convert_video_to_anaglyph(v, output, direction, anaglyph_type);
-        }
+            convert_video_to_anaglyph(v, output, direction, anaglyph_type);
+        },
+        #[cfg(not(feature = "video"))]
+        (_, _, _, Some(_)) => panic!("Video support not enabled"),
         _ => panic!("No or invalid input provided"),
     }
-
 }
 
 // convert left/right into anaglpyh
@@ -147,4 +149,9 @@ fn convert_stereoscopic(
             anaglyph_type,
         )),
     }
+}
+
+#[cfg(feature = "video")]
+fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: video::VideoDirection, anaglyph_type: AnaglyphType) {
+    video::convert_video_to_anaglyph(video, video_out, direction, anaglyph_type);
 }
