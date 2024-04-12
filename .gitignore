@@ -1,1 +1,8 @@
 /target
+**/*.mp4
+**/*.mov
+**/*.git
+*.jpeg
+*.jpg
+*.gif
+**/*.webm
