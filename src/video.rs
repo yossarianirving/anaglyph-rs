@@ -41,6 +41,8 @@ pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoD
 
     let mut previous_frame = decoder.decode().unwrap();
 
+    let anaglyph_matrix = anaglyph::anaglyph_type_to_matrix(anaglyph_type);
+
     thread::spawn(move || {
         for frame in decoder.decode_iter() {
             if let Ok((time, frame)) = frame {
@@ -81,7 +83,7 @@ pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoD
                             left_slice,
                             right_slice,
                             new_slice,
-                            &anaglyph_type,
+                            anaglyph_matrix,
                         )
                     }
                 }
