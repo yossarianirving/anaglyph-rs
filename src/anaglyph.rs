@@ -35,6 +35,11 @@ const HALF_COLOR_MATRIX: [[f32; 9]; 2] = [
     [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
 ];
 
+pub enum VideoDirection {
+    Clockwise,
+    CounterClockwise,
+}
+
 pub fn anaglyph_type_to_matrix(anaglyph_type: AnaglyphType) -> &'static [[f32; 9]; 2] {
     match anaglyph_type {
         AnaglyphType::True => &TRUE_MATRIX,

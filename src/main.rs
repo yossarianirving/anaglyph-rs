@@ -1,8 +1,9 @@
 use anaglyph_rs::anaglyph::{
-    left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset,
+    left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset, VideoDirection
 };
 #[cfg(feature = "video")]
 use anaglyph_rs::video;
+use anaglyph_rs::gif::convert_gif_to_anaglyph;
 use clap::{arg, command, value_parser};
 use image::{imageops, io::Reader as ImageReader, DynamicImage, RgbImage};
 
@@ -16,7 +17,8 @@ fn main() {
         .arg(arg!(-x --"offset-x" <OFFSET> "Offset in x direction (images only)").required(false).allow_negative_numbers(true).value_parser(value_parser!(i32)).default_value("0"))
         .arg(arg!(-y --"offset-y" <OFFSET> "Offset in y direction (images only)").required(false).allow_negative_numbers(true).value_parser(value_parser!(i32)).default_value("0"))
         .arg(arg!(-v --video <FILE> "Video file").required(false))
-        .arg(arg!(-d --"video-direction" <DIRECTION> "Direction of video (clockwise or counter-clockwise)").required(false).value_parser(["clockwise", "counter-clockwise"]).default_value("clockwise"))
+        .arg(arg!(-g --gif <FILE> "Gif file").required(false))
+        .arg(arg!(-d --"video-direction" <DIRECTION> "Direction of video/gif (clockwise or counter-clockwise)").required(false).value_parser(["clockwise", "counter-clockwise"]).default_value("clockwise"))
         .get_matches();
 
     let anaglyph_type = match matches
@@ -35,19 +37,20 @@ fn main() {
         x: matches.get_one::<i32>("offset-x").unwrap().clone(),
         y: matches.get_one::<i32>("offset-y").unwrap().clone(),
     };
-    let (left, right, stereo, video) = (
+    let (left, right, stereo, video, gif) = (
         matches.get_one::<String>("left"),
         matches.get_one::<String>("right"),
         matches.get_one::<String>("stereo"),
         matches.get_one::<String>("video"),
+        matches.get_one::<String>("gif"),
     );
 
     let output = matches
         .get_one::<String>("out")
         .expect("Output should not be empty");
 
-    match (left, right, stereo, video) {
-        (Some(l), Some(r), None, None) => {
+    match (left, right, stereo, video, gif) {
+        (Some(l), Some(r), None, None, None) => {
             let anaglyph =
                 convert_left_right(l, r, anaglyph_type, Some(offset));
             match anaglyph.save(output) {
@@ -55,7 +58,7 @@ fn main() {
                 Err(i) => panic!("{}", i),
             };
         }
-        (None, None, Some(s), None) => {
+        (None, None, Some(s), None, None) => {
             let anaglyph = convert_stereoscopic(s.to_string(), anaglyph_type, Some(offset));
             match anaglyph.save(output) {
                 Ok(_) => println!(""),
@@ -63,20 +66,32 @@ fn main() {
             };
         }
         #[cfg(feature = "video")]
-        (None, None, None, Some(v)) => {
+        (None, None, None, Some(v), None) => {
             let direction = match matches
                 .get_one::<String>("video-direction")
                 .expect("Direction should not be empty")
                 .as_str()
             {
-                "clockwise" => video::VideoDirection::Clockwise,
-                "counter-clockwise" => video::VideoDirection::CounterClockwise,
+                "clockwise" => VideoDirection::Clockwise,
+                "counter-clockwise" => VideoDirection::CounterClockwise,
                 _ => panic!("Invalid video direction"),
             };
             convert_video_to_anaglyph(v, output, direction, anaglyph_type);
         },
+        (None, None, None, None, Some(g)) => {
+            let direction = match matches
+                .get_one::<String>("video-direction")
+                .expect("Direction should not be empty")
+                .as_str()
+            {
+                "clockwise" => VideoDirection::Clockwise,
+                "counter-clockwise" => VideoDirection::CounterClockwise,
+                _ => panic!("Invalid video direction"),
+            };
+            convert_gif_to_anaglyph(g, output, direction, anaglyph_type);
+        }
         #[cfg(not(feature = "video"))]
-        (_, _, _, Some(_)) => panic!("Video support not enabled"),
+        (_, _, _, Some(_), None) => panic!("Video support not enabled"),
         _ => panic!("No or invalid input provided"),
     }
 }
@@ -152,6 +167,6 @@ fn convert_stereoscopic(
 }
 
 #[cfg(feature = "video")]
-fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: video::VideoDirection, anaglyph_type: AnaglyphType) {
+fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoDirection, anaglyph_type: AnaglyphType) {
     video::convert_video_to_anaglyph(video, video_out, direction, anaglyph_type);
 }

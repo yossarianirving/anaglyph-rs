@@ -7,14 +7,9 @@ use video_rs::encode::{Encoder, Settings};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::anaglyph;
+use crate::anaglyph::{VideoDirection, AnaglyphType, anaglyph_type_to_matrix, combine_slices};
 
-pub enum VideoDirection {
-    Clockwise,
-    CounterClockwise,
-}
-
-pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoDirection, anaglyph_type: anaglyph::AnaglyphType) {
+pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoDirection, anaglyph_type: AnaglyphType) {
     video_rs::init().unwrap();
     let mut decoder = match Decoder::new(Path::new(video)) {
         Ok(decoder) => decoder,
@@ -41,7 +36,7 @@ pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoD
 
     let mut previous_frame = decoder.decode().unwrap();
 
-    let anaglyph_matrix = anaglyph::anaglyph_type_to_matrix(anaglyph_type);
+    let anaglyph_matrix = anaglyph_type_to_matrix(anaglyph_type);
 
     thread::spawn(move || {
         for frame in decoder.decode_iter() {
@@ -79,7 +74,7 @@ pub fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoD
                             .slice_mut(ndarray::s![j, i, ..])
                             .into_slice()
                             .unwrap();
-                        anaglyph::combine_slices(
+                        combine_slices(
                             left_slice,
                             right_slice,
                             new_slice,
