@@ -1,11 +1,11 @@
 use anaglyph_rs::anaglyph::{
-    left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset, VideoDirection
+    left_right_to_anaglyph, left_right_to_anaglyph_offset, AnaglyphType, Offset, VideoDirection,
 };
+use anaglyph_rs::gif::convert_gif_to_anaglyph;
 #[cfg(feature = "video")]
 use anaglyph_rs::video;
-use anaglyph_rs::gif::convert_gif_to_anaglyph;
 use clap::{arg, command, value_parser};
-use image::{imageops, io::Reader as ImageReader, DynamicImage, RgbImage};
+use image::{imageops, DynamicImage, ImageReader, RgbImage};
 
 fn main() {
     let matches = command!()
@@ -51,8 +51,7 @@ fn main() {
 
     match (left, right, stereo, video, gif) {
         (Some(l), Some(r), None, None, None) => {
-            let anaglyph =
-                convert_left_right(l, r, anaglyph_type, Some(offset));
+            let anaglyph = convert_left_right(l, r, anaglyph_type, Some(offset));
             match anaglyph.save(output) {
                 Ok(_) => println!(""),
                 Err(i) => panic!("{}", i),
@@ -77,7 +76,7 @@ fn main() {
                 _ => panic!("Invalid video direction"),
             };
             convert_video_to_anaglyph(v, output, direction, anaglyph_type);
-        },
+        }
         (None, None, None, None, Some(g)) => {
             let direction = match matches
                 .get_one::<String>("video-direction")
@@ -167,6 +166,11 @@ fn convert_stereoscopic(
 }
 
 #[cfg(feature = "video")]
-fn convert_video_to_anaglyph(video: &str, video_out: &str, direction: VideoDirection, anaglyph_type: AnaglyphType) {
+fn convert_video_to_anaglyph(
+    video: &str,
+    video_out: &str,
+    direction: VideoDirection,
+    anaglyph_type: AnaglyphType,
+) {
     video::convert_video_to_anaglyph(video, video_out, direction, anaglyph_type);
 }
