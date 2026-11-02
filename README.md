@@ -16,6 +16,8 @@ Building with the video feature requires you to install a ffmpeg dev libraries o
 cargo build --release --features video
 ```
 
+The video pipeline uses hardware acceleration where available: frames are decoded with the GPU (VAAPI, CUDA or VDPAU) and the anaglyph combination is computed by a `wgpu` compute shader (Vulkan/DX12/Metal). If no suitable GPU is found it falls back to a parallel CPU implementation, so it works everywhere, just slower.
+
 ## Usage
 
 To convert the test left and right images into an anaglyph run the following command and wear a pair of red/cyan glasses to view.
