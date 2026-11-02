@@ -1,7 +1,6 @@
 use crate::anaglyph::{anaglyph_type_to_matrix, combine_slices, AnaglyphType, VideoDirection};
-use image::buffer::ConvertBuffer;
 use image::codecs::gif::{GifDecoder, GifEncoder};
-use image::{AnimationDecoder, DynamicImage, Frame, ImageDecoder, RgbImage};
+use image::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 
@@ -25,48 +24,51 @@ pub fn convert_gif_buffer_to_anaglyph(
         .expect("Failed to get first frame");
     let delay = first_frame.delay();
 
-    let mut previous_frame = DynamicImage::ImageRgba8(first_frame.into_buffer())
-        .into_rgb8()
-        .into_vec();
+    let mut previous_frame = first_frame.into_buffer(); // RgbaImage
 
     let mut new_frames = Vec::<Frame>::new();
     for (_frame_index, frame) in frames.enumerate() {
         let frame = frame.expect("Failed to get frame");
-        let frame = ConvertBuffer::<RgbImage>::convert(&frame.into_buffer()).into_vec();
-        let mut new_frame = vec![255; (gif_size.0 * gif_size.1 * 3) as usize];
-        for i in 0..gif_size.0 {
-            for j in 0..gif_size.1 {
-                let index = (j * gif_size.0 + i) as usize * 3;
-                let (left_slice, right_slice) = match direction {
-                    VideoDirection::Clockwise => {
-                        let left = &frame[index..index + 3];
-                        let right = &previous_frame[index..index + 3];
-                        (left, right)
-                    }
-                    VideoDirection::CounterClockwise => {
-                        let left = &previous_frame[index..index + 3];
-                        let right = &frame[index..index + 3];
-                        (left, right)
-                    }
+        let rgba_frame = frame.into_buffer(); // RgbaImage
+
+        let mut new_frame = Vec::with_capacity((gif_size.0 * gif_size.1 * 4) as usize); // RGBA
+
+        for j in 0..gif_size.1 {
+            for i in 0..gif_size.0 {
+                let (left_pixel, right_pixel) = match direction {
+                    VideoDirection::Clockwise => (
+                        rgba_frame.get_pixel(i, j).0,
+                        previous_frame.get_pixel(i, j).0,
+                    ),
+                    VideoDirection::CounterClockwise => (
+                        previous_frame.get_pixel(i, j).0,
+                        rgba_frame.get_pixel(i, j).0,
+                    ),
                 };
-                let mut anaglyph_slice = vec![0, 0, 0];
-                combine_slices(
-                    &left_slice,
-                    &right_slice,
-                    &mut anaglyph_slice,
-                    &anaglyph_matrix,
-                );
-                new_frame[index..index + 3].clone_from_slice(&anaglyph_slice);
+
+                // If either pixel is fully transparent, set output transparent
+                if left_pixel[3] == 0 && right_pixel[3] == 0 {
+                    new_frame.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    let mut anaglyph_slice = vec![0, 0, 0];
+                    combine_slices(
+                        &left_pixel[0..3],
+                        &right_pixel[0..3],
+                        &mut anaglyph_slice,
+                        &anaglyph_matrix,
+                    );
+                    new_frame.extend_from_slice(&[
+                        anaglyph_slice[0],
+                        anaglyph_slice[1],
+                        anaglyph_slice[2],
+                        255,
+                    ]);
+                }
             }
         }
-        let new_rgb_frame = RgbImage::from_vec(gif_size.0, gif_size.1, new_frame).unwrap();
-        new_frames.push(Frame::from_parts(
-            DynamicImage::ImageRgb8(new_rgb_frame).into_rgba8(),
-            0,
-            0,
-            delay,
-        ));
-        previous_frame = frame;
+        let new_rgba_frame = RgbaImage::from_vec(gif_size.0, gif_size.1, new_frame).unwrap();
+        new_frames.push(Frame::from_parts(new_rgba_frame, 0, 0, delay));
+        previous_frame = rgba_frame;
         // Optionally: println!("Processed frame {}", frame_index + 1);
     }
 
