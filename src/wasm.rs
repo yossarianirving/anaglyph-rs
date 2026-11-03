@@ -17,6 +17,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::anaglyph::{AnaglyphType, VideoDirection};
 use crate::gif::convert_gif_buffer_to_anaglyph_async;
+use std::str::FromStr;
 
 /// Convert an animated GIF (given as raw bytes) into a red/cyan anaglyph GIF,
 /// returned as a `Uint8Array`.
@@ -33,23 +34,8 @@ pub async fn convert_gif_to_anaglyph(
     direction: &str,
     anaglyph_type: &str,
 ) -> Result<Vec<u8>, JsValue> {
-    let direction = match direction {
-        "clockwise" => VideoDirection::Clockwise,
-        "counter-clockwise" => VideoDirection::CounterClockwise,
-        other => return Err(JsValue::from_str(&format!("unknown direction: {other}"))),
-    };
-    let anaglyph_type = match anaglyph_type {
-        "color" => AnaglyphType::Color,
-        "half-color" => AnaglyphType::HalfColor,
-        "grayscale" => AnaglyphType::GrayScale,
-        "optimized" => AnaglyphType::Optimized,
-        "true" => AnaglyphType::True,
-        other => {
-            return Err(JsValue::from_str(&format!(
-                "unknown anaglyph type: {other}"
-            )))
-        }
-    };
+    let direction = VideoDirection::from_str(direction).map_err(|e| JsValue::from_str(&e))?;
+    let anaglyph_type = AnaglyphType::from_str(anaglyph_type).map_err(|e| JsValue::from_str(&e))?;
 
     convert_gif_buffer_to_anaglyph_async(gif, direction, anaglyph_type)
         .await

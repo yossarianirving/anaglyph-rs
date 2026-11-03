@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy (each feature combination; errors are warnings)
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features parallel -- -D warnings
+          cargo clippy --all-targets --features gpu -- -D warnings
+          cargo clippy --all-targets --features parallel,gpu -- -D warnings
+      - name: Tests
+        # GPU-backed tests skip themselves when no adapter is available.
+        run: cargo test --features parallel,gpu
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Check browser build
+        run: cargo check --target wasm32-unknown-unknown --features wasm --lib
+
+  # The `video` feature needs ffmpeg dev libraries on the runner image.
+  video:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install ffmpeg dev libraries
+        run: sudo apt-get update && sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev libavdevice-dev nasm
+      - name: Clippy (video)
+        run: cargo clippy --all-targets --features video -- -D warnings
+      - name: Tests (video)
+        run: cargo test --features video

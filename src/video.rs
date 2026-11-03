@@ -10,9 +10,7 @@ use video_rs::ffmpeg::Rational;
 use video_rs::hwaccel::HardwareAccelerationDeviceType;
 use video_rs::Time;
 
-use crate::anaglyph::{
-    anaglyph_type_to_matrix, combine_slices, AnaglyphType, VideoDirection,
-};
+use crate::anaglyph::{anaglyph_type_to_matrix, combine_slices, AnaglyphType, VideoDirection};
 use crate::gpu::GpuBlender;
 use crate::hwencode::{EncodeOptions, VaapiEncoder};
 
@@ -27,6 +25,11 @@ const HWACCEL_PREFERENCE: [HardwareAccelerationDeviceType; 3] = [
 /// Caps memory in flight at roughly `queue * frame size` and provides
 /// backpressure when the encoder falls behind.
 const ENCODE_QUEUE_DEPTH: usize = 8;
+
+/// Depth of the queue between the decode thread and the blending loop. Also
+/// bounded: decoding (especially on the GPU) outruns blending by far, and an
+/// unbounded queue would pile up raw frames until memory runs out.
+const DECODE_QUEUE_DEPTH: usize = 8;
 
 /// Which encoder backend to use for the output video.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,18 +49,30 @@ enum Backend {
 }
 
 impl Backend {
-    /// Encode one dense RGB24 frame.
-    fn encode(&mut self, rgb: &[u8], time: Time, shape: (usize, usize)) -> Result<(), String> {
+    /// Encode one dense RGB24 frame, returning the buffer on success so the
+    /// caller keeps ownership (the encode thread recycles it as the guard
+    /// frame without copying).
+    fn encode(
+        &mut self,
+        rgb: Vec<u8>,
+        time: Time,
+        shape: (usize, usize),
+    ) -> Result<Vec<u8>, String> {
         match self {
             Backend::Software(encoder) => {
                 let (height, width) = shape;
-                let frame = Array3::from_shape_vec((height, width, 3), rgb.to_vec())
-                    .map_err(|e| e.to_string())?;
-                encoder.encode(&frame, time).map_err(|e| e.to_string())
+                let frame =
+                    Array3::from_shape_vec((height, width, 3), rgb).map_err(|e| e.to_string())?;
+                encoder.encode(&frame, time).map_err(|e| e.to_string())?;
+                // Frames built by `from_shape_vec` always have a standard
+                // layout, so the raw vec offset is None and the buffer is
+                // returned as-is.
+                Ok(frame.into_raw_vec_and_offset().0)
             }
             Backend::Hardware(encoder) => {
                 let pts = time.into_value().unwrap_or(0);
-                encoder.encode(rgb, pts)
+                encoder.encode(&rgb, pts)?;
+                Ok(rgb)
             }
         }
     }
@@ -68,6 +83,19 @@ impl Backend {
             Backend::Hardware(encoder) => encoder.finish(),
         }
     }
+}
+
+/// Summary of a finished conversion, for the caller to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversionReport {
+    /// Number of blended frames encoded.
+    pub frames: u64,
+    /// Decoder used, e.g. `"cpu"` or `"VaApi hardware"`.
+    pub decoder: String,
+    /// Blender used, e.g. `"GPU (wgpu)"` or a CPU fallback with the reason.
+    pub blender: String,
+    /// Encoder used, e.g. `"VAAPI (h264_vaapi)"` or a fallback with the reason.
+    pub encoder: String,
 }
 
 /// A unit of encoding work handed to the encode thread.
@@ -95,10 +123,11 @@ pub fn convert_video_to_anaglyph(
     anaglyph_type: AnaglyphType,
     decoder_choice: DecoderChoice,
     encoder_choice: EncoderChoice,
-) {
-    video_rs::init().unwrap();
+) -> Result<ConversionReport, String> {
+    video_rs::init().map_err(|e| format!("failed to initialize ffmpeg: {e}"))?;
 
     let mut builder = DecoderBuilder::new(Path::new(video));
+    let mut decoder_name = "cpu".to_string();
     // Note: GPU decoding downloads each frame back to system memory for the
     // blend step, which on many setups (including iGPUs) is slower than just
     // decoding on the CPU. Hardware decoding helps for high resolutions or
@@ -108,60 +137,53 @@ pub fn convert_video_to_anaglyph(
             .iter()
             .find(|device| device.is_available())
         {
-            println!("Using {:?} hardware decoding", device);
+            decoder_name = format!("{device:?} hardware");
             builder = builder.with_hardware_acceleration(*device);
+        } else {
+            decoder_name = "cpu (no compatible hardware device found)".into();
         }
     }
-    let mut decoder = match builder.build() {
-        Ok(decoder) => decoder,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return;
-        }
-    };
+    let mut decoder = builder
+        .build()
+        .map_err(|e| format!("failed to open {video}: {e}"))?;
 
     let video_size = decoder.size();
     let (width, height) = (video_size.0 as usize, video_size.1 as usize);
     let decoder_time_base = decoder.time_base();
 
-    let backend = match create_backend(encoder_choice, video_out, width, height, decoder_time_base)
-    {
-        Ok(backend) => backend,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return;
-        }
-    };
+    let (backend, encoder_name) =
+        create_backend(encoder_choice, video_out, width, height, decoder_time_base)?;
 
-    println!(" {:?}", video_size);
     let anaglyph_matrix = anaglyph_type_to_matrix(anaglyph_type);
-    let mut blender = match GpuBlender::new(video_size.0, video_size.1, anaglyph_matrix) {
-        Ok(blender) => Some(blender),
-        Err(e) => {
-            eprintln!("GPU blending unavailable ({}), falling back to CPU", e);
-            None
-        }
-    };
+    let (mut blender, mut blender_name) =
+        match GpuBlender::new(video_size.0, video_size.1, anaglyph_matrix) {
+            Ok(b) => (Some(b), "GPU (wgpu)".to_string()),
+            Err(e) => (None, format!("CPU (rayon, GPU unavailable: {e})")),
+        };
 
-    let first_frame = match decoder.decode() {
-        Ok(frame) => frame,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return;
-        }
-    };
+    let first_frame = decoder
+        .decode()
+        .map_err(|e| format!("failed to decode {video}: {e}"))?;
 
-    // Decode on a background thread while this thread blends.
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
+    // Decode on a background thread while this thread blends. The channel is
+    // bounded (backpressure) and carries decode failures, so a broken stream
+    // surfaces to the caller instead of silently truncating the output.
+    let (tx, rx) = mpsc::sync_channel::<Result<(Time, Array3<u8>), String>>(DECODE_QUEUE_DEPTH);
+    let decode_thread = thread::spawn(move || {
+        // `decode_iter` yields forever: end of stream arrives as the
+        // `DecodeExhausted` sentinel, which is a normal stop, not a failure.
         for frame in decoder.decode_iter() {
             match frame {
                 Ok(time_frame) => {
-                    if tx.send(time_frame).is_err() {
-                        break;
+                    if tx.send(Ok(time_frame)).is_err() {
+                        break; // consumer is gone
                     }
                 }
-                Err(_) => break,
+                Err(video_rs::error::Error::DecodeExhausted) => break,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("decode error: {e}")));
+                    break;
+                }
             }
         }
     });
@@ -174,17 +196,35 @@ pub fn convert_video_to_anaglyph(
     let mut timestamp_repair = TimestampRepair::new(decoder_time_base);
     let mut previous_frame = Some(first_frame);
     let mut frame_count: u64 = 0;
-    let mut failure: Option<String> = None;
-    for (time, frame) in rx {
+    let mut decode_error: Option<String> = None;
+    for item in rx {
+        let (time, frame) = match item {
+            Ok(time_frame) => time_frame,
+            Err(e) => {
+                decode_error = Some(e);
+                break;
+            }
+        };
         let (previous_time, previous) = previous_frame.take().unwrap();
         let (left, right) = match direction {
             VideoDirection::Clockwise => (raw_rgb(&frame), raw_rgb(&previous)),
             VideoDirection::CounterClockwise => (raw_rgb(&previous), raw_rgb(&frame)),
         };
 
-        let rgb = match &mut blender {
+        let blended = match &mut blender {
             Some(gpu) => gpu.blend(left, right),
-            None => blend_cpu(left, right, anaglyph_matrix),
+            None => Ok(blend_cpu(left, right, anaglyph_matrix)),
+        };
+        let rgb = match blended {
+            Ok(rgb) => rgb,
+            Err(e) => {
+                // GPU device lost or readback failed mid-run: drop to CPU
+                // blending for this and all remaining frames rather than
+                // killing the conversion.
+                blender = None;
+                blender_name = format!("CPU (rayon, GPU blend failed mid-run: {e})");
+                blend_cpu(left, right, anaglyph_matrix)
+            }
         };
 
         let encode_time = timestamp_repair.repair(previous_time);
@@ -195,33 +235,53 @@ pub fn convert_video_to_anaglyph(
         frame_count += 1;
         previous_frame = Some((time, frame));
     }
+    // The `for` loop consumed `rx`; dropping it here (implicit at break)
+    // releases the decode thread if it was blocked on a full queue.
 
     // Give the muxer a packet beyond the final real frame: the MP4 muxer
     // cannot derive a duration for the very last packet and ends the track at
     // its PTS, which makes strict readers drop the final frame. One duplicate
     // frame at the end lets every real frame get a duration; the duplicate
     // itself lands at the track end and is invisible during playback.
-    if failure.is_none() {
-        if let Some(guard_time) = timestamp_repair.next_time() {
-            let _ = job_tx.send(Job::Guard(guard_time));
-        }
+    if let Some(guard_time) = timestamp_repair.next_time() {
+        let _ = job_tx.send(Job::Guard(guard_time));
     }
     drop(job_tx);
 
-    match encode_thread.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => failure = Some(e),
-        Err(_) => failure = Some("encode thread panicked".into()),
+    let encode_result = match encode_thread.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("encoding failed: {e}")),
+        Err(_) => Err("encode thread panicked".into()),
+    };
+    // The channel receiver is gone, so the decode thread is unwinding too.
+    let _ = decode_thread.join();
+
+    encode_result?;
+    if let Some(e) = decode_error {
+        return Err(format!(
+            "decoding stopped early after {frame_count} frames: {e}"
+        ));
     }
-    match failure {
-        None => println!("Encoded {} frames", frame_count),
-        Some(e) => eprintln!("Encode error: {}", e),
+    if frame_count == 0 {
+        return Err(format!(
+            "{video} contains fewer than two frames; nothing to blend"
+        ));
     }
+
+    Ok(ConversionReport {
+        frames: frame_count,
+        decoder: decoder_name,
+        blender: blender_name,
+        encoder: encoder_name,
+    })
 }
 
 /// Move a backend onto its own thread. The returned sender accepts jobs;
 /// drop it to end the thread, whose `join()` yields the final result.
-fn spawn_encoder(backend: Backend, shape: (usize, usize)) -> (SyncSender<Job>, JoinHandle<Result<(), String>>) {
+fn spawn_encoder(
+    backend: Backend,
+    shape: (usize, usize),
+) -> (SyncSender<Job>, JoinHandle<Result<(), String>>) {
     let (job_tx, job_rx) = mpsc::sync_channel::<Job>(ENCODE_QUEUE_DEPTH);
     let handle = thread::spawn(move || {
         let mut backend = backend;
@@ -229,11 +289,10 @@ fn spawn_encoder(backend: Backend, shape: (usize, usize)) -> (SyncSender<Job>, J
         for job in job_rx.iter() {
             match job {
                 Job::Frame(rgb, time) => {
-                    backend.encode(&rgb, time, shape)?;
-                    last_frame = Some(rgb);
+                    last_frame = Some(backend.encode(rgb, time, shape)?);
                 }
                 Job::Guard(time) => {
-                    if let Some(rgb) = last_frame.as_ref() {
+                    if let Some(rgb) = last_frame.take() {
                         backend.encode(rgb, time, shape)?;
                     }
                 }
@@ -244,15 +303,16 @@ fn spawn_encoder(backend: Backend, shape: (usize, usize)) -> (SyncSender<Job>, J
     (job_tx, handle)
 }
 
-/// Create the encoding backend for the output file.
+/// Create the encoding backend for the output file, along with a
+/// human-readable description of the chosen backend.
 fn create_backend(
     choice: EncoderChoice,
     video_out: &str,
     width: usize,
     height: usize,
     decoder_time_base: Rational,
-) -> Result<Backend, String> {
-    let hardware = || -> Result<Backend, String> {
+) -> Result<(Backend, String), String> {
+    let hardware = || -> Result<(Backend, String), String> {
         let encoder = VaapiEncoder::new(
             Path::new(video_out),
             width as u32,
@@ -260,26 +320,32 @@ fn create_backend(
             decoder_time_base,
             EncodeOptions::default(),
         )?;
-        println!("Using VAAPI hardware encoding");
-        Ok(Backend::Hardware(Box::new(encoder)))
+        Ok((
+            Backend::Hardware(Box::new(encoder)),
+            "VAAPI (h264_vaapi)".to_string(),
+        ))
     };
-    let software = || -> Result<Backend, String> {
+    let software = || -> Result<(Backend, String), String> {
         let settings = Settings::preset_h264_yuv420p(width, height, false);
         let encoder = Encoder::new(Path::new(video_out), settings)
             .map_err(|e| format!("failed to create software encoder: {}", e))?;
-        println!("Using software (libx264) encoding");
-        Ok(Backend::Software(Box::new(encoder)))
+        Ok((
+            Backend::Software(Box::new(encoder)),
+            "software (libx264)".to_string(),
+        ))
     };
 
     match choice {
         EncoderChoice::Software => software(),
         EncoderChoice::Hardware => hardware(),
         EncoderChoice::Auto => match hardware() {
-            Ok(backend) => Ok(backend),
-            Err(e) => {
-                eprintln!("Hardware encoding unavailable ({}), falling back to software", e);
-                software()
-            }
+            Ok(ok) => Ok(ok),
+            Err(e) => software().map(|(backend, _)| {
+                (
+                    backend,
+                    format!("software (libx264, VAAPI unavailable: {e})"),
+                )
+            }),
         },
     }
 }
@@ -290,13 +356,14 @@ fn blend_cpu(left: &[u8], right: &[u8], anaglyph_matrix: &[[f32; 9]; 2]) -> Vec<
     out.par_chunks_mut(3)
         .zip(left.par_chunks_exact(3))
         .zip(right.par_chunks_exact(3))
-        .for_each(|((out, left), right)| {
-            combine_slices(left, right, out, anaglyph_matrix)
-        });
+        .for_each(|((out, left), right)| combine_slices(left, right, out, anaglyph_matrix));
     out
 }
 
 /// Get a contiguous RGB24 byte slice from a decoded frame.
+///
+/// Invariant, not input validation: video-rs hands out densely packed,
+/// `Vec`-backed `Array3<u8>` frames, so `as_slice` cannot fail.
 fn raw_rgb(frame: &ndarray::Array3<u8>) -> &[u8] {
     frame.as_slice().expect("decoded frames are contiguous")
 }
@@ -352,5 +419,52 @@ impl TimestampRepair {
             }
             time
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use video_rs::ffmpeg::ffi;
+
+    fn tb() -> Rational {
+        Rational(1, 30)
+    }
+
+    #[test]
+    fn repair_passes_valid_timestamps_through() {
+        let mut repair = TimestampRepair::new(tb());
+        assert_eq!(
+            repair.repair(Time::new(Some(0), tb())).into_value(),
+            Some(0)
+        );
+        assert_eq!(
+            repair.repair(Time::new(Some(2), tb())).into_value(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn repair_synthesizes_missing_timestamps_from_observed_step() {
+        let mut repair = TimestampRepair::new(tb());
+        repair.repair(Time::new(Some(10), tb()));
+        repair.repair(Time::new(Some(12), tb())); // observed step: 2
+        assert_eq!(repair.repair(Time::new(None, tb())).into_value(), Some(14));
+        assert_eq!(
+            repair
+                .repair(Time::new(Some(ffi::AV_NOPTS_VALUE), tb()))
+                .into_value(),
+            Some(16)
+        );
+        assert_eq!(repair.next_time().and_then(Time::into_value), Some(18));
+    }
+
+    #[test]
+    fn repair_without_known_step_leaves_timestamp_untouched() {
+        let mut repair = TimestampRepair::new(tb());
+        repair.repair(Time::new(Some(5), tb()));
+        // Only one observation so far: no step to extrapolate from.
+        assert!(!repair.repair(Time::new(None, tb())).has_value());
+        assert!(repair.next_time().is_none());
     }
 }

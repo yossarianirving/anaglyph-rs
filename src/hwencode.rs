@@ -70,7 +70,8 @@ fn check(code: c_int, what: &str) -> Result<()> {
 ///
 /// Every pointer field is null unless owned, so `Drop` doubles as the
 /// cleanup path for partially constructed encoders.
-pub struct VaapiEncoder {    /// Encoder codec context (may carry an open or merely allocated state).
+pub struct VaapiEncoder {
+    /// Encoder codec context (may carry an open or merely allocated state).
     enc_ctx: *mut ffi::AVCodecContext,
     /// Opened muxer context (owns `pb` once `avio_open2` succeeded).
     fmt_ctx: *mut ffi::AVFormatContext,
@@ -130,13 +131,7 @@ impl VaapiEncoder {
         Ok(enc)
     }
 
-    fn init(
-        &mut self,
-        path: &Path,
-        width: u32,
-        height: u32,
-        options: EncodeOptions,
-    ) -> Result<()> {
+    fn init(&mut self, path: &Path, width: u32, height: u32, options: EncodeOptions) -> Result<()> {
         unsafe {
             // --- hardware device ---
             check(
@@ -193,11 +188,23 @@ impl VaapiEncoder {
             // Constant QP rate control; no target bitrate needed and closest
             // in spirit to x264's default CRF mode.
             let mut dict: *mut ffi::AVDictionary = ptr::null_mut();
-            set_option(&mut dict, "rc_mode", "CQP")?;
-            set_option(&mut dict, "qp", &options.qp.to_string())?;
-            set_option(&mut dict, "async_depth", &options.async_depth.to_string())?;
-            if options.low_power {
-                set_option(&mut dict, "low_power", "1")?;
+            let configured = set_option(&mut dict, "rc_mode", "CQP")
+                .and_then(|_| set_option(&mut dict, "qp", &options.qp.to_string()))
+                .and_then(|_| {
+                    set_option(&mut dict, "async_depth", &options.async_depth.to_string())
+                })
+                .and_then(|_| {
+                    if options.low_power {
+                        set_option(&mut dict, "low_power", "1")
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(e) = configured {
+                if !dict.is_null() {
+                    ffi::av_dict_free(&mut dict);
+                }
+                return Err(e);
             }
             let open = ffi::avcodec_open2(self.enc_ctx, codec, &mut dict);
             if !dict.is_null() {
@@ -205,7 +212,13 @@ impl VaapiEncoder {
                 // got here with leftovers the option names are wrong.
                 let leftover = first_dict_key(dict);
                 ffi::av_dict_free(&mut dict);
-                return Err(format!("unsupported encoder options: {}", leftover));
+                if open < 0 {
+                    return Err(format!(
+                        "opening h264_vaapi encoder: {} (unconsumed option: {leftover})",
+                        err_str(open)
+                    ));
+                }
+                return Err(format!("unsupported encoder options: {leftover}"));
             }
             check(open, "opening h264_vaapi encoder")?;
 
@@ -232,8 +245,7 @@ impl VaapiEncoder {
                 width as c_int,
                 height as c_int,
                 ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-                ffi::SwsFlags::SWS_BILINEAR as c_int
-                    | ffi::SwsFlags::SWS_ACCURATE_RND as c_int,
+                ffi::SwsFlags::SWS_BILINEAR as c_int | ffi::SwsFlags::SWS_ACCURATE_RND as c_int,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null(),
@@ -348,6 +360,10 @@ impl VaapiEncoder {
             return Ok(());
         }
         unsafe {
+            // Bounded drain: keep pumping the NULL flush signal until the
+            // encoder reports EOF and stops yielding packets. The idle
+            // counter bounds the loop so a stuck driver cannot spin forever.
+            let mut idle_rounds = 0;
             loop {
                 let ret = ffi::avcodec_send_frame(self.enc_ctx, ptr::null());
                 let flushed = ret == ffi::AVERROR_EOF;
@@ -357,6 +373,14 @@ impl VaapiEncoder {
                 let got = self.drain_packets()?;
                 if flushed && !got {
                     break;
+                }
+                if got {
+                    idle_rounds = 0;
+                } else {
+                    idle_rounds += 1;
+                    if idle_rounds > 2 {
+                        return Err("encoder made no progress while flushing".into());
+                    }
                 }
             }
             if self.header_written {
@@ -461,26 +485,8 @@ fn first_dict_key(dict: *mut ffi::AVDictionary) -> String {
         if entry.is_null() || (*entry).key.is_null() {
             return "(unknown)".into();
         }
-        std::ffi::CStr::from_ptr((*entry).key).to_string_lossy().into_owned()
-    }
-}
-
-/// Whether a VAAPI device can be opened on this machine.
-pub fn vaapi_available() -> bool {
-    unsafe {
-        let mut device_ref: *mut ffi::AVBufferRef = ptr::null_mut();
-        let code = ffi::av_hwdevice_ctx_create(
-            &mut device_ref,
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-            ptr::null(),
-            ptr::null_mut(),
-            0,
-        );
-        if code == 0 && !device_ref.is_null() {
-            ffi::av_buffer_unref(&mut device_ref);
-            true
-        } else {
-            false
-        }
+        std::ffi::CStr::from_ptr((*entry).key)
+            .to_string_lossy()
+            .into_owned()
     }
 }

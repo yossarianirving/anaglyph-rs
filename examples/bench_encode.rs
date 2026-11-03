@@ -69,12 +69,16 @@ fn report(name: &str, t: &Timed) {
 fn main() {
     video_rs::init().unwrap();
     let args: Vec<String> = std::env::args().collect();
-    let input = args.get(1).map(String::as_str).unwrap_or("/tmp/opencode/anaglyph/testsrc1080.mp4");
-    let wanted: usize = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300);
-    let out_dir = PathBuf::from(args.get(3).map(String::as_str).unwrap_or("/tmp/opencode/anaglyph"));
+    let input = args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("/tmp/opencode/anaglyph/testsrc1080.mp4");
+    let wanted: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(300);
+    let out_dir = PathBuf::from(
+        args.get(3)
+            .map(String::as_str)
+            .unwrap_or("/tmp/opencode/anaglyph"),
+    );
     std::fs::create_dir_all(&out_dir).unwrap();
 
     // --- decode source frames ---
@@ -110,7 +114,7 @@ fn main() {
     let mut blender = GpuBlender::new(w, h, matrix).expect("gpu blender");
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(decoded.len() - 1);
     for pair in decoded.windows(2) {
-        frames.push(blender.blend(&pair[1], &pair[0]));
+        frames.push(blender.blend(&pair[1], &pair[0]).expect("blend"));
     }
     drop(decoded);
     let n = frames.len();
@@ -129,12 +133,15 @@ fn main() {
     let (c0u, c0s) = cpu_time();
     let t = Instant::now();
     {
-        let mut enc =
-            Encoder::new(sw_path.as_path(), Settings::preset_h264_yuv420p(w as usize, h as usize, false))
-                .expect("software encoder");
+        let mut enc = Encoder::new(
+            sw_path.as_path(),
+            Settings::preset_h264_yuv420p(w as usize, h as usize, false),
+        )
+        .expect("software encoder");
         for (i, f) in frames.iter().enumerate() {
             let arr = Array3::from_shape_vec((h as usize, w as usize, 3), f.clone()).unwrap();
-            enc.encode(&arr, Time::new(Some(i as i64), fps_tb)).expect("sw encode");
+            enc.encode(&arr, Time::new(Some(i as i64), fps_tb))
+                .expect("sw encode");
         }
         enc.finish().expect("sw finish");
     }
@@ -153,11 +160,51 @@ fn main() {
 
     // --- hardware encode (h264_vaapi, CQP 23), several tunings ---
     let variants = [
-        ("hw async_depth=2 ", EncodeOptions { qp: 23, gop_size: 12, async_depth: 2, low_power: false }),
-        ("hw async_depth=4 ", EncodeOptions { qp: 23, gop_size: 12, async_depth: 4, low_power: false }),
-        ("hw async_depth=8 ", EncodeOptions { qp: 23, gop_size: 12, async_depth: 8, low_power: false }),
-        ("hw async_depth=16", EncodeOptions { qp: 23, gop_size: 12, async_depth: 16, low_power: false }),
-        ("hw async=8 lowpwr", EncodeOptions { qp: 23, gop_size: 12, async_depth: 8, low_power: true }),
+        (
+            "hw async_depth=2 ",
+            EncodeOptions {
+                qp: 23,
+                gop_size: 12,
+                async_depth: 2,
+                low_power: false,
+            },
+        ),
+        (
+            "hw async_depth=4 ",
+            EncodeOptions {
+                qp: 23,
+                gop_size: 12,
+                async_depth: 4,
+                low_power: false,
+            },
+        ),
+        (
+            "hw async_depth=8 ",
+            EncodeOptions {
+                qp: 23,
+                gop_size: 12,
+                async_depth: 8,
+                low_power: false,
+            },
+        ),
+        (
+            "hw async_depth=16",
+            EncodeOptions {
+                qp: 23,
+                gop_size: 12,
+                async_depth: 16,
+                low_power: false,
+            },
+        ),
+        (
+            "hw async=8 lowpwr",
+            EncodeOptions {
+                qp: 23,
+                gop_size: 12,
+                async_depth: 8,
+                low_power: true,
+            },
+        ),
     ];
     for (label, opts) in variants {
         let hw_path = out_dir.join("bench_only_hw.mp4");

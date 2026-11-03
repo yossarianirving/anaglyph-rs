@@ -2,11 +2,22 @@
 name = "anaglyph-rs"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Convert stereo image pairs, gifs and videos into red/cyan anaglyphs"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[[example]]
+name = "bench_encode"
+required-features = ["video"]
+
+[[example]]
+name = "bench_gif"
+required-features = ["gpu"]
+
+[[example]]
+name = "bench_stages"
+required-features = ["video"]
 
 [dependencies]
 clap = { version = "4.5.4", features = ["derive", "cargo"] }
@@ -34,6 +45,3 @@ parallel = ["dep:rayon"]
 video = ["dep:video-rs", "dep:ndarray", "parallel", "gpu"]
 # wasm-bindgen entry points for the browser; implies `gpu`.
 wasm = ["gpu", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
-
-[profile.release]
-#debug=true

@@ -13,8 +13,13 @@
 //! `R, G, B, 0` in memory, so the RGB24 readback only needs a
 //! stride 4 -> 3 unpad.
 //!
+//! Sums are rounded (half away from zero) and clamped to `0..=255` before
+//! quantizing, matching the CPU reference in `anaglyph::combine_slices`.
+//!
 //! The synchronous API (`new`, `blend`, `blend_rgba`) is native-only: it
-//! waits on the GPU with a blocking poll. On wasm (browser WebGPU) the async
+//! waits on the GPU with a blocking poll and returns an error (rather than
+//! panicking) when the device is lost or the readback fails, so callers can
+//! fall back to CPU blending. On wasm (browser WebGPU) the async
 //! `new_async` / `blend_rgba_async` pair replaces it, since blocking the
 //! event loop is not allowed there.
 
@@ -82,9 +87,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         dot(mats.left[1].xyz, l) + dot(mats.right[1].xyz, r),
         dot(mats.left[2].xyz, l) + dot(mats.right[2].xyz, r),
     );
-    let clamped = clamp(out, vec3<f32>(0.0), vec3<f32>(255.0));
-    out_frame[i] =
-        u32(clamped.x) | (u32(clamped.y) << 8u) | (u32(clamped.z) << 16u);
+    // round + clamp matches the CPU reference (Rust f32::round is also
+    // half-away-from-zero); u32() alone would truncate toward zero.
+    let q = clamp(round(out), vec3<f32>(0.0), vec3<f32>(255.0));
+    out_frame[i] = u32(q.x) | (u32(q.y) << 8u) | (u32(q.z) << 16u);
 }
 
 // RGBA variant (gifs): every pixel is exactly one 32-bit word, so no
@@ -110,11 +116,8 @@ fn main_rgba(@builtin(global_invocation_id) global_id: vec3<u32>) {
         dot(mats.left[1].xyz, l) + dot(mats.right[1].xyz, r),
         dot(mats.left[2].xyz, l) + dot(mats.right[2].xyz, r),
     );
-    let clamped = clamp(out, vec3<f32>(0.0), vec3<f32>(255.0));
-    out_frame[i] = u32(clamped.x)
-        | (u32(clamped.y) << 8u)
-        | (u32(clamped.z) << 16u)
-        | 0xFF000000u;
+    let q = clamp(round(out), vec3<f32>(0.0), vec3<f32>(255.0));
+    out_frame[i] = u32(q.x) | (u32(q.y) << 8u) | (u32(q.z) << 16u) | 0xFF000000u;
 }
 "#;
 
@@ -128,6 +131,9 @@ struct Uniforms {
     left: [[f32; 4]; 3],
     right: [[f32; 4]; 3],
 }
+
+// `to_bytes` hand-rolls this layout; fail fast if the struct ever drifts.
+const _: () = assert!(core::mem::size_of::<Uniforms>() == 112);
 
 /// Convert the anaglyph matrix (`[[f32; 9]; 2]`, row-major rows for the left
 /// and right side) into the uniform buffer layout.
@@ -194,12 +200,11 @@ pub struct GpuBlender {
     frame_buffers: [wgpu::Buffer; 2],
     out_buffer: wgpu::Buffer,
     readback: wgpu::Buffer,
-    /// Total upload length: `4 * pixels + 4` — covers an RGBA frame plus one
-    /// sentinel word (so the RGB24 path's straddling reads stay in bounds).
-    upload_len: usize,
     /// Output byte count: 4 bytes per pixel.
     out_len: usize,
-    /// Reusable staging buffer for padding RGB24 uploads to 4-byte multiples.
+    /// Reusable staging buffer for padding RGB24 uploads to 4-byte multiples
+    /// (`4 * pixels + 4`, including the sentinel word); its tail is zero and
+    /// stays zero across uploads.
     staging: Vec<u8>,
     pixel_count: u32,
     /// 2D workgroup grid for the blend dispatch.
@@ -417,7 +422,6 @@ impl GpuBlender {
             frame_buffers,
             out_buffer,
             readback,
-            upload_len,
             out_len: out_bytes as usize,
             staging: vec![0u8; upload_len],
             pixel_count,
@@ -429,9 +433,15 @@ impl GpuBlender {
     /// Blend `left` and `right` (dense RGB24, `3 * width * height` bytes each)
     /// on the GPU and return the result as a dense RGB24 vec.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn blend(&mut self, left: &[u8], right: &[u8]) -> Vec<u8> {
-        debug_assert_eq!(left.len() as u64, (self.pixel_count as u64) * 3);
-        debug_assert_eq!(right.len() as u64, (self.pixel_count as u64) * 3);
+    pub fn blend(&mut self, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
+        let expected = (self.pixel_count as u64) * 3;
+        if left.len() as u64 != expected || right.len() as u64 != expected {
+            return Err(format!(
+                "frame size mismatch: got {}/{} bytes, expected {expected}",
+                left.len(),
+                right.len()
+            ));
+        }
 
         let p = self.parity;
         self.parity ^= 1;
@@ -439,14 +449,14 @@ impl GpuBlender {
         self.upload(left, p);
         self.upload(right, p ^ 1);
 
-        let words = self.run_and_read(p, false);
+        let words = self.run_and_read(p, false)?;
 
         // Unpad stride 4 -> stride 3.
         let mut out = vec![0u8; (self.pixel_count as usize) * 3];
         for (src, dst) in words.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
             dst.copy_from_slice(&src[..3]);
         }
-        out
+        Ok(out)
     }
 
     /// Blend `left` and `right` (dense RGBA, `4 * width * height` bytes each)
@@ -454,17 +464,23 @@ impl GpuBlender {
     /// inputs are fully transparent stay transparent; everything else becomes
     /// opaque.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn blend_rgba(&mut self, left: &[u8], right: &[u8]) -> Vec<u8> {
+    pub fn blend_rgba(&mut self, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
         let len = (self.pixel_count as usize) * 4;
-        debug_assert_eq!(left.len(), len);
-        debug_assert_eq!(right.len(), len);
+        if left.len() != len || right.len() != len {
+            return Err(format!(
+                "frame size mismatch: got {}/{} bytes, expected {len}",
+                left.len(),
+                right.len()
+            ));
+        }
 
         let p = self.parity;
         self.parity ^= 1;
 
         // RGBA frames are already word-aligned; no staging padding needed.
         self.queue.write_buffer(&self.frame_buffers[p], 0, left);
-        self.queue.write_buffer(&self.frame_buffers[p ^ 1], 0, right);
+        self.queue
+            .write_buffer(&self.frame_buffers[p ^ 1], 0, right);
 
         self.run_and_read(p, true)
     }
@@ -487,7 +503,8 @@ impl GpuBlender {
         self.parity ^= 1;
 
         self.queue.write_buffer(&self.frame_buffers[p], 0, left);
-        self.queue.write_buffer(&self.frame_buffers[p ^ 1], 0, right);
+        self.queue
+            .write_buffer(&self.frame_buffers[p ^ 1], 0, right);
 
         let mut encoder = self
             .device
@@ -529,7 +546,7 @@ impl GpuBlender {
     /// copy the output into the readback buffer, and block until `out_len`
     /// bytes are readable as `4`-byte-per-pixel words.
     #[cfg(not(target_arch = "wasm32"))]
-    fn run_and_read(&mut self, parity: usize, rgba: bool) -> Vec<u8> {
+    fn run_and_read(&mut self, parity: usize, rgba: bool) -> Result<Vec<u8>, String> {
         let pipeline = if rgba {
             &self.pipeline_rgba
         } else {
@@ -553,24 +570,33 @@ impl GpuBlender {
         encoder.copy_buffer_to_buffer(&self.out_buffer, 0, &self.readback, 0, self.out_len as u64);
         self.queue.submit([encoder.finish()]);
 
-        // Wait for the compute pass, then read the result back.
+        // Wait for the compute pass, then read the result back. The
+        // map_async callback fires while `poll` waits, so `rx.recv` cannot
+        // block indefinitely once poll returns; a disconnected channel or
+        // an errored map means the device is gone — report, don't panic,
+        // so callers can fall back to CPU blending.
         let (tx, rx) = mpsc::channel();
         let slice = self.readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|e| format!("gpu poll failed: {e}"))?;
         match rx.recv() {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => panic!("gpu readback mapping failed: {e}"),
-            Err(e) => panic!("gpu readback wait failed: {e}"),
+            Ok(Err(e)) => return Err(format!("gpu readback mapping failed: {e}")),
+            Err(_) => return Err("gpu readback wait cancelled".into()),
         }
-        let mapped = slice.get_mapped_range().expect("gpu readback range").to_vec();
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|e| format!("gpu readback range: {e}"))?
+            .to_vec();
         self.readback.unmap();
-        mapped
+        Ok(mapped)
     }
 
     /// Stage one RGB24 frame into the padded upload buffer and copy it into
@@ -579,16 +605,31 @@ impl GpuBlender {
     fn upload(&mut self, frame: &[u8], target: usize) {
         let len = frame.len();
         self.staging[..len].copy_from_slice(frame);
-        self.staging[len..self.upload_len].fill(0);
+        // The tail past `len` is zero from construction and never written
+        // (every RGB24 frame has the same length), so no re-padding needed.
         self.queue
             .write_buffer(&self.frame_buffers[target], 0, &self.staging);
     }
 }
 
-#[cfg(test)]
+// The sync blend API exercised here is native-only; the wasm path is checked
+// by compiling against the async entry points instead.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::anaglyph::combine_slices;
+
+    /// Construct a blender or skip the test when no GPU adapter is
+    /// available (headless CI), so `cargo test` stays green everywhere.
+    fn blender_or_skip(width: u32, height: u32, matrix: &[[f32; 9]; 2]) -> Option<GpuBlender> {
+        match GpuBlender::new(width, height, matrix) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping gpu test (no usable device): {e}");
+                None
+            }
+        }
+    }
 
     fn reference(left: &[u8], right: &[u8], matrix: &[[f32; 9]; 2]) -> Vec<u8> {
         let mut out = vec![0u8; left.len()];
@@ -611,14 +652,16 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         ];
+        let Some(mut gpu) = blender_or_skip(w as u32, h as u32, &matrix) else {
+            return;
+        };
         let n = w * h * 3;
         let left: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(7) % 251) as u8).collect();
         let right: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(13) % 199) as u8).collect();
 
-        let mut gpu = GpuBlender::new(w as u32, h as u32, &matrix).expect("gpu available");
         // Run twice to also exercise ping-pong buffer parity.
         for _ in 0..2 {
-            let out = gpu.blend(&left, &right);
+            let out = gpu.blend(&left, &right).expect("gpu blend");
             assert_eq!(out, reference(&left, &right, &matrix));
         }
     }
@@ -646,6 +689,9 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         ];
+        let Some(mut gpu) = blender_or_skip(w as u32, h as u32, &matrix) else {
+            return;
+        };
         let n = w * h * 4;
         // Sprinkle fully transparent pixels through both frames so the
         // both-transparent rule and the force-opaque rule are exercised.
@@ -664,10 +710,43 @@ mod tests {
             })
             .collect();
 
-        let mut gpu = GpuBlender::new(w as u32, h as u32, &matrix).expect("gpu available");
         for _ in 0..2 {
-            let out = gpu.blend_rgba(&left, &right);
+            let out = gpu.blend_rgba(&left, &right).expect("gpu rgba blend");
             assert_eq!(out, reference_rgba(&left, &right, &matrix));
         }
+    }
+
+    /// The WGSL `Matrices` struct and the hand-rolled `to_bytes` writer must
+    /// agree on offsets; a silent drift here garbles every blend.
+    #[test]
+    fn uniform_bytes_match_shader_layout() {
+        let matrix = [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0],
+        ];
+        let bytes = uniforms(0x11223344, 0x55667788, &matrix).to_bytes();
+
+        assert_eq!(&bytes[0..4], &0x11223344u32.to_le_bytes()); // width
+        assert_eq!(&bytes[4..8], &0x55667788u32.to_le_bytes()); // height
+        assert_eq!(&bytes[8..16], &[0u8; 8]); // padding
+
+        // Left rows start at byte 16; each row is 3 coefficients plus a 0
+        // pad word (16-byte rows), so the last left value sits at 16+40=56.
+        assert_eq!(&bytes[16..20], &1.0f32.to_le_bytes());
+        assert_eq!(&bytes[20..24], &2.0f32.to_le_bytes());
+        assert_eq!(&bytes[24..28], &3.0f32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &0.0f32.to_le_bytes());
+        assert_eq!(&bytes[56..60], &9.0f32.to_le_bytes()); // last left value
+
+        // Right side follows the left (16 + 3 * 16 = 64).
+        assert_eq!(&bytes[64..68], &(-1.0f32).to_le_bytes());
+        assert_eq!(&bytes[104..108], &(-9.0f32).to_le_bytes());
+    }
+
+    #[test]
+    fn frame_too_large_is_an_error() {
+        let matrix = crate::anaglyph::anaglyph_type_to_matrix(crate::anaglyph::AnaglyphType::Color);
+        // u32::MAX x 2 overflows the pixel count.
+        assert!(GpuBlender::new(u32::MAX, 2, matrix).is_err());
     }
 }
