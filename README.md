@@ -16,7 +16,20 @@ Building with the video feature requires you to install a ffmpeg dev libraries o
 cargo build --release --features video
 ```
 
-The video pipeline uses hardware acceleration where available: frames are decoded with the GPU (VAAPI, CUDA or VDPAU) and the anaglyph combination is computed by a `wgpu` compute shader (Vulkan/DX12/Metal). If no suitable GPU is found it falls back to a parallel CPU implementation, so it works everywhere, just slower.
+The video pipeline uses hardware acceleration where available: the anaglyph combination is computed by a `wgpu` compute shader (Vulkan/DX12/Metal), and the output is encoded with the GPU VAAPI encoder (`h264_vaapi`) by default, falling back to software (libx264) when no VAAPI device is present. Decoding runs on the CPU by default; GPU decoding is available with `-D hardware` but is often *slower* end-to-end because every frame has to be downloaded back to system memory for the blend step. If no suitable GPU is found the blend falls back to a parallel CPU implementation, so it works everywhere, just slower.
+
+### Encoder benchmarks
+
+Measured on an AMD Radeon 8060S iGPU (Strix Halo), half-color mode, encoder backend selected with `-e`:
+
+| Input | Encoder | Wall | CPU time | Output |
+|---|---|---|---|---|
+| 1080p, 599 frames | `-e hardware` | 3.7 s | 7.2 s | 18 MiB |
+| 1080p, 599 frames | `-e software` | 2.8–6.0 s | 20.5 s | 13 MiB |
+| 4K, 299 frames | `-e hardware` | 7.2 s | 15.7 s | 36 MiB |
+| 4K, 299 frames | `-e software` | 7.2 s | 40.3 s | 24 MiB |
+
+Hardware encoding cuts CPU time by roughly 3x with visually identical output (≈43 dB PSNR vs the software-encoded file) at the cost of ~40% more bytes (CQP qp=23 vs x264 CRF 23). Wall time is comparable at 1080p and dominated by decode + blend at 4K; the encoder is no longer the bottleneck. VAAPI's `low_power` mode is not exposed because many Mesa drivers do not implement it.
 
 ## Usage
 
@@ -39,3 +52,5 @@ If the video feature in enabled, a standard video can be converted to a pseudo 3
 ```sh
 cargo run --features video --release -- --video test/short.mp4 --out hs.mp4
 ```
+
+Two flags control the hardware pipeline for video: `-e/--encoder auto|hardware|software` selects the output encoder (`auto`, the default, prefers VAAPI and falls back to libx264), and `-D/--decode cpu|hardware` selects the decoder (CPU is the default; see the benchmark note above).

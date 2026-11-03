@@ -19,6 +19,8 @@ fn main() {
         .arg(arg!(-v --video <FILE> "Video file").required(false))
         .arg(arg!(-g --gif <FILE> "Gif file").required(false))
         .arg(arg!(-d --"video-direction" <DIRECTION> "Direction of video/gif (clockwise or counter-clockwise)").required(false).value_parser(["clockwise", "counter-clockwise"]).default_value("clockwise"))
+        .arg(arg!(-e --encoder <ENCODER> "Video encoder backend (auto, hardware, or software)").required(false).value_parser(["auto", "hardware", "software"]).default_value("auto"))
+        .arg(arg!(-D --decode <DECODER> "Video decoder mode (cpu or hardware)").required(false).value_parser(["cpu", "hardware"]).default_value("cpu"))
         .get_matches();
 
     let anaglyph_type = match matches
@@ -75,7 +77,24 @@ fn main() {
                 "counter-clockwise" => VideoDirection::CounterClockwise,
                 _ => panic!("Invalid video direction"),
             };
-            convert_video_to_anaglyph(v, output, direction, anaglyph_type);
+            let encoder = match matches
+                .get_one::<String>("encoder")
+                .expect("Encoder should not be empty")
+                .as_str()
+            {
+                "hardware" => video::EncoderChoice::Hardware,
+                "software" => video::EncoderChoice::Software,
+                _ => video::EncoderChoice::Auto,
+            };
+            let decoder = match matches
+                .get_one::<String>("decode")
+                .expect("Decoder should not be empty")
+                .as_str()
+            {
+                "hardware" => video::DecoderChoice::Hardware,
+                _ => video::DecoderChoice::Cpu,
+            };
+            convert_video_to_anaglyph(v, output, direction, anaglyph_type, decoder, encoder);
         }
         (None, None, None, None, Some(g)) => {
             let direction = match matches
@@ -171,6 +190,8 @@ fn convert_video_to_anaglyph(
     video_out: &str,
     direction: VideoDirection,
     anaglyph_type: AnaglyphType,
+    decoder: video::DecoderChoice,
+    encoder: video::EncoderChoice,
 ) {
-    video::convert_video_to_anaglyph(video, video_out, direction, anaglyph_type);
+    video::convert_video_to_anaglyph(video, video_out, direction, anaglyph_type, decoder, encoder);
 }

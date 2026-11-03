@@ -15,11 +15,13 @@ use std::sync::mpsc;
 
 use wgpu::util::DeviceExt;
 
-const WORKGROUP_SIZE: u32 = 64;
+/// Workgroup tile is 8x8 threads; a plain 1D dispatch would exceed the
+/// 65535-per-dimension workgroup limit at ~4.2 megapixels (4K and beyond).
+const TILE: u32 = 8;
 
 const SHADER: &str = r#"
 struct Matrices {
-    header: vec4<u32>, // .x = num_pixels, rest padding (vec4 keeps the struct at 16-byte alignment)
+    header: vec4<u32>, // .x = width, .y = height, rest padding (vec4 keeps the struct at 16-byte alignment)
     left: array<vec4<f32>, 3>,
     right: array<vec4<f32>, 3>,
 };
@@ -42,12 +44,12 @@ fn unpack_rgb32(packed: u32) -> vec3<f32> {
     );
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= mats.header.x) {
+    if (global_id.x >= mats.header.x || global_id.y >= mats.header.y) {
         return;
     }
+    let i = global_id.y * mats.header.x + global_id.x;
     let byte = i * 3u;
     let word = byte >> 2u;
     let shift = (byte & 3u) * 8u;
@@ -82,15 +84,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Uniforms {
-    num_pixels: u32,
-    _pad: [u32; 3],
+    width: u32,
+    height: u32,
+    _pad: [u32; 2],
     left: [[f32; 4]; 3],
     right: [[f32; 4]; 3],
 }
 
 /// Convert the anaglyph matrix (`[[f32; 9]; 2]`, row-major rows for the left
 /// and right side) into the uniform buffer layout.
-fn uniforms(num_pixels: u32, matrix: &[[f32; 9]; 2]) -> Uniforms {
+fn uniforms(width: u32, height: u32, matrix: &[[f32; 9]; 2]) -> Uniforms {
     let rows = |m: &[f32; 9]| -> [[f32; 4]; 3] {
         [
             [m[0], m[1], m[2], 0.0],
@@ -99,8 +102,9 @@ fn uniforms(num_pixels: u32, matrix: &[[f32; 9]; 2]) -> Uniforms {
         ]
     };
     Uniforms {
-        num_pixels,
-        _pad: [0; 3],
+        width,
+        height,
+        _pad: [0; 2],
         left: rows(&matrix[0]),
         right: rows(&matrix[1]),
     }
@@ -117,8 +121,8 @@ impl Uniforms {
             bytes[pos..pos + 4].copy_from_slice(&v.to_le_bytes());
             pos += 4;
         };
-        push(self.num_pixels);
-        push(0);
+        push(self.width);
+        push(self.height);
         push(0);
         push(0);
         for side in [self.left, self.right] {
@@ -153,7 +157,8 @@ pub struct GpuBlender {
     /// Reusable staging buffer for padding uploads to 4-byte multiples.
     staging: Vec<u8>,
     pixel_count: u32,
-    workgroups: u32,
+    /// 2D workgroup grid for the blend dispatch.
+    dispatch: (u32, u32),
     parity: usize,
 }
 
@@ -206,7 +211,16 @@ impl GpuBlender {
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
 
-        let uniforms = uniforms(pixel_count, matrix).to_bytes();
+        let (dispatch_x, dispatch_y) = (width.div_ceil(TILE), height.div_ceil(TILE));
+        let max_groups = device.limits().max_compute_workgroups_per_dimension;
+        if dispatch_x > max_groups || dispatch_y > max_groups {
+            return Err(format!(
+                "frame too large for GPU: dispatch grid {dispatch_x}x{dispatch_y} \
+                 exceeds per-dimension workgroup limit {max_groups}"
+            ));
+        }
+
+        let uniforms = uniforms(width, height, matrix).to_bytes();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("anaglyph-matrices"),
             contents: &uniforms,
@@ -343,7 +357,7 @@ impl GpuBlender {
             out_len: out_bytes as usize,
             staging: vec![0u8; upload_len],
             pixel_count,
-            workgroups: pixel_count.div_ceil(WORKGROUP_SIZE),
+            dispatch: (dispatch_x, dispatch_y),
             parity: 0,
         })
     }
@@ -372,7 +386,7 @@ impl GpuBlender {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_groups[p], &[]);
-            pass.dispatch_workgroups(self.workgroups, 1, 1);
+            pass.dispatch_workgroups(self.dispatch.0, self.dispatch.1, 1);
         }
         encoder.copy_buffer_to_buffer(&self.out_buffer, 0, &self.readback, 0, self.out_len as u64);
         self.queue.submit([encoder.finish()]);
