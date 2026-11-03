@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>anaglyph gif converter — WebGPU + wasm</title>
+</head>
+<body>
+  <h1>Anaglyph GIF converter</h1>
+  <p>
+    Frames are blended by a wgpu compute shader (browser WebGPU) compiled to
+    wasm; without WebGPU the same code falls back to a CPU loop.
+  </p>
+  <p id="gpu">checking WebGPU…</p>
+  <input type="file" id="file" accept="image/gif" />
+  <select id="type">
+    <option>color</option>
+    <option>half-color</option>
+    <option>grayscale</option>
+    <option>optimized</option>
+    <option>true</option>
+  </select>
+  <button id="go">convert</button>
+  <pre id="status" data-state="idle"></pre>
+  <div>
+    <img id="in" alt="input" />
+    <img id="out" alt="output" />
+  </div>
+
+  <script type="module">
+    import init, { convert_gif_to_anaglyph } from "/pkg/anaglyph_rs.js";
+    await init();
+    document.getElementById("gpu").textContent =
+      "gpu" in navigator ? "WebGPU: available" : "WebGPU: NOT available (CPU fallback)";
+
+    const status = document.getElementById("status");
+    async function convert(bytes, name) {
+      status.dataset.state = "running";
+      status.textContent = "converting…";
+      const t0 = performance.now();
+      try {
+        const out = await convert_gif_to_anaglyph(bytes, "clockwise", document.getElementById("type").value);
+        const ms = Math.round(performance.now() - t0);
+        status.textContent = `ok ${name}: ${ms} ms, ${(out.length / 1048576).toFixed(2)} MiB out`;
+        status.dataset.state = "done";
+        return out;
+      } catch (e) {
+        status.textContent = `error: ${e}`;
+        status.dataset.state = "error";
+        throw e;
+      }
+    }
+
+    // Auto-run against a bundled sample when present (gifs are not kept in
+    // the repo), otherwise wait for a file from the picker.
+    let sampleBytes = null;
+    for (const url of ["/web/3drot.gif", "/test/3drot.gif"]) {
+      const r = await fetch(url);
+      if (r.ok) {
+        sampleBytes = new Uint8Array(await r.arrayBuffer());
+        break;
+      }
+    }
+    if (sampleBytes) {
+      document.getElementById("in").src = URL.createObjectURL(new Blob([sampleBytes]));
+      const out = await convert(sampleBytes, "3drot.gif");
+      document.getElementById("out").src = URL.createObjectURL(new Blob([out]));
+    } else {
+      status.textContent = "no sample gif at web/3drot.gif or test/3drot.gif — pick a file";
+    }
+
+    document.getElementById("go").onclick = async () => {
+      const f = document.getElementById("file").files[0];
+      if (!f) return;
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      document.getElementById("in").src = URL.createObjectURL(new Blob([bytes]));
+      const o = await convert(bytes, f.name);
+      document.getElementById("out").src = URL.createObjectURL(new Blob([o]));
+    };
+  </script>
+</body>
+</html>
