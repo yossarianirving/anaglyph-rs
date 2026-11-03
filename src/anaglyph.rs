@@ -231,33 +231,39 @@ pub fn left_right_to_anaglyph(
 /// WGSL's `round`) and saturate to `0..=255`, so the CPU reference and the
 /// GPU compute shader produce identical output and no matrix coefficient can
 /// make the result wrap around.
+///
+/// Implemented as `floor(v + 0.5)` on the positive branch instead of
+/// `f32::round`: on baseline x86-64 (no SSE4.1) `round` lowers to a scalar
+/// libm call, costing ~2x the whole blend loop, while the plain truncating
+/// cast vectorizes. For `v > 0` the two are bit-identical, and `v <= 0`
+/// clamps to 0 either way.
 #[inline]
 fn to_u8(v: f32) -> u8 {
-    let r = v.round();
-    if r <= 0.0 {
+    if v <= 0.0 {
         0
-    } else if r >= 255.0 {
+    } else if v >= 255.0 {
         255
     } else {
-        r as u8
+        // v in (0, 255) so v + 0.5 < 255.5 and the cast cannot overflow.
+        (v + 0.5) as u8
     }
 }
 
 #[inline]
-fn dot3(px: [f32; 3], row: &[f32]) -> f32 {
-    px[0] * row[0] + px[1] * row[1] + px[2] * row[2]
+fn dot3(px: [f32; 3], a: f32, b: f32, c: f32) -> f32 {
+    px[0] * a + px[1] * b + px[2] * c
 }
 
 /// Blend one RGB pixel pair with the anaglyph matrix:
 /// `out[c] = dot(M_left[c], left) + dot(M_right[c], right)`.
 ///
 /// `left`, `right` and `anaglyph` are read as their first three bytes.
-pub fn combine_slices(
-    left: &[u8],
-    right: &[u8],
-    anaglyph: &mut [u8],
-    anaglyph_matrix: &[[f32; 9]; 2],
-) {
+/// Fully unrolled with fixed indices: a dynamically indexed row loop defeats
+/// the optimizer and costs ~2x here. `#[inline]` matters just as much — the
+/// out-of-line form turns every pixel in the blend loops into an indirect
+/// call and blocks vectorization.
+#[inline]
+pub fn combine_slices(left: &[u8], right: &[u8], anaglyph: &mut [u8], m: &[[f32; 9]; 2]) {
     let l = [f32::from(left[0]), f32::from(left[1]), f32::from(left[2])];
     let r = [
         f32::from(right[0]),
@@ -265,12 +271,9 @@ pub fn combine_slices(
         f32::from(right[2]),
     ];
 
-    for (c, out) in anaglyph.iter_mut().take(3).enumerate() {
-        let row = c * 3;
-        let sum =
-            dot3(l, &anaglyph_matrix[0][row..row + 3]) + dot3(r, &anaglyph_matrix[1][row..row + 3]);
-        *out = to_u8(sum);
-    }
+    anaglyph[0] = to_u8(dot3(l, m[0][0], m[0][1], m[0][2]) + dot3(r, m[1][0], m[1][1], m[1][2]));
+    anaglyph[1] = to_u8(dot3(l, m[0][3], m[0][4], m[0][5]) + dot3(r, m[1][3], m[1][4], m[1][5]));
+    anaglyph[2] = to_u8(dot3(l, m[0][6], m[0][7], m[0][8]) + dot3(r, m[1][6], m[1][7], m[1][8]));
 }
 
 #[cfg(test)]
