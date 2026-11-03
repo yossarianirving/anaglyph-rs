@@ -82,10 +82,11 @@ pub fn convert_gif_buffer_to_anaglyph(
     encode_anaglyph(new_frames)
 }
 
-/// Async variant of [`convert_gif_buffer_to_anaglyph`] for wasm: initializes
-/// the WebGPU device and blends frames without blocking the event loop,
-/// falling back to CPU blending when WebGPU is unavailable.
-#[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+/// Async variant of [`convert_gif_buffer_to_anaglyph`] for wasm: decodes
+/// with error handling instead of panicking (a wasm panic would silently
+/// kill a worker), blends frames on WebGPU without blocking the event loop
+/// when the `gpu` feature is enabled, and stays on the CPU otherwise.
+#[cfg(target_arch = "wasm32")]
 pub async fn convert_gif_buffer_to_anaglyph_async(
     gif_data: &[u8],
     direction: VideoDirection,
@@ -108,8 +109,13 @@ pub async fn convert_gif_buffer_to_anaglyph_async(
 
     // Fall back to CPU blending when WebGPU is unavailable; report the
     // reason on the JS console so the fallback is visible during debugging.
+    #[cfg(feature = "gpu")]
     let mut gpu = match GpuBlender::new_async(gif_size.0, gif_size.1, anaglyph_matrix).await {
-        Ok(blender) => Some(blender),
+        Ok(blender) => {
+            #[cfg(feature = "wasm")]
+            web_sys::console::log_1(&"anaglyph: blending frames on WebGPU".into());
+            Some(blender)
+        }
         Err(e) => {
             #[cfg(feature = "wasm")]
             web_sys::console::warn_1(
@@ -136,10 +142,13 @@ pub async fn convert_gif_buffer_to_anaglyph_async(
             ),
         };
 
+        #[cfg(feature = "gpu")]
         let blended = match &mut gpu {
             Some(blender) => blender.blend_rgba_async(left, right).await?,
             None => combine_rgba(left, right, anaglyph_matrix),
         };
+        #[cfg(not(feature = "gpu"))]
+        let blended = combine_rgba(left, right, anaglyph_matrix);
 
         let new_rgba_frame = RgbaImage::from_vec(gif_size.0, gif_size.1, blended)
             .ok_or("blended frame has unexpected size")?;
