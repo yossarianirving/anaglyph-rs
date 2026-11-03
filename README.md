@@ -68,13 +68,34 @@ desktop CPU the gif encoder dominates the runtime (~90% of it), so GPU vs CPU
 blending is roughly a wash natively. The GPU path matters most in the browser,
 where the CPU fallback is single-threaded (see below).
 
-If the video feature in enabled, a standard video can be converted to a pseudo 3-D video with some **strong** caveats. First, the camera must be moving in an arc in a consistent direction throughout the entire video. Second, the subjects and background should be mostly static. An ideal video for this program is one taken by a 360 photo booth, though those videos often change directions for a "boomerang" effect so some editing is necessary.
+If the video feature in enabled, a standard video can be converted to a pseudo 3-D video with some **strong** caveats. First, the camera must be moving in an arc around a mostly static subject. Second, the background should be mostly static too. An ideal video for this program is one taken by a 360 photo booth.
 
 ```sh
 cargo run --features video --release -- --video test/short.mp4 --out hs.mp4
 ```
 
+By default (`-d clockwise`) the whole video is paired with one fixed eye
+ordering, so a clip that reverses direction for a "boomerang" pass needs to be
+cut in half first. `-d auto` removes that requirement: the program measures
+the frame-to-frame image drift, detects every point where the camera changes
+orbit direction, and swaps the left/right pairing from there on.
+
+```sh
+cargo run --features video --release -- --video booth.mp4 --out hs.mp4 -d auto
+```
+
+Each detected reversal is printed (`reversal at 12.01s (frame 361): clockwise
+-> counter-clockwise`) and the output stays correct across scene cuts and when
+the subject moves against the camera. If the result looks *pseudoscopic* (the
+depth is inverted) your rig's rotation runs opposite to the assumed
+convention: `-d auto-reverse` flips the detected pairing. Auto mode adds about
+0.5 ms per frame of analysis, which is hidden inside the decode step.
+
 Two flags control the hardware pipeline for video: `-e/--encoder auto|hardware|software` selects the output encoder (`auto`, the default, prefers VAAPI and falls back to libx264), and `-D/--decode cpu|hardware` selects the decoder (CPU is the default; see the benchmark note above).
+
+To debug or tune detection, `--motion-json timeline.json` (with `-d auto`)
+writes the per-frame motion trace — measured drift, whether the frame matched
+reliably, the detected trend, and the reversal points — as JSON.
 
 ## Web (wasm + WebGPU)
 

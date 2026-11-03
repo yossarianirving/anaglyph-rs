@@ -24,7 +24,8 @@ fn run() -> Result<(), String> {
         .arg(arg!(-y --"offset-y" <OFFSET> "Offset in y direction (images only)").required(false).allow_negative_numbers(true).value_parser(value_parser!(i32)).default_value("0").conflicts_with_all(["video", "gif"]))
         .arg(arg!(-v --video <FILE> "Video file").required(false).conflicts_with_all(["left", "right", "stereo", "gif"]))
         .arg(arg!(-g --gif <FILE> "Gif file").required(false).conflicts_with_all(["left", "right", "stereo", "video"]))
-        .arg(arg!(-d --"video-direction" <DIRECTION> "Direction of video/gif (clockwise or counter-clockwise)").required(false).value_parser(["clockwise", "counter-clockwise"]).default_value("clockwise"))
+        .arg(arg!(-d --"video-direction" <DIRECTION> "Direction of video/gif; auto detects direction changes (clockwise, counter-clockwise, auto, auto-reverse)").required(false).value_parser(["clockwise", "counter-clockwise", "auto", "auto-reverse"]).default_value("clockwise"))
+        .arg(arg!(--"motion-json" <FILE> "Write the detected motion timeline to a JSON file (requires --video with -d auto)").required(false))
         .arg(arg!(-e --encoder <ENCODER> "Video encoder backend (auto, hardware, or software)").required(false).value_parser(["auto", "hardware", "software"]).default_value("auto"))
         .arg(arg!(-D --decode <DECODER> "Video decoder mode (cpu or hardware)").required(false).value_parser(["cpu", "hardware"]).default_value("cpu"))
         .get_matches();
@@ -36,12 +37,15 @@ fn run() -> Result<(), String> {
             .expect("clap provides a default type"),
     )
     .expect("clap restricts --type to valid values");
-    let direction = VideoDirection::from_str(
-        matches
-            .get_one::<String>("video-direction")
-            .expect("clap provides a default direction"),
-    )
-    .expect("clap restricts --video-direction to valid values");
+    let direction_name = matches
+        .get_one::<String>("video-direction")
+        .expect("clap provides a default direction")
+        .as_str();
+    let auto_direction = match direction_name {
+        "auto" => Some(false),
+        "auto-reverse" => Some(true),
+        _ => None,
+    };
     let offset = Offset {
         x: *matches.get_one::<i32>("offset-x").expect("clap default"),
         y: *matches.get_one::<i32>("offset-y").expect("clap default"),
@@ -54,6 +58,11 @@ fn run() -> Result<(), String> {
         matches.get_one::<String>("video"),
         matches.get_one::<String>("gif"),
     );
+    if auto_direction.is_some() && video.is_none() {
+        return Err(
+            "automatic direction (-d auto / auto-reverse) is only supported with --video".into(),
+        );
+    }
 
     let output = matches
         .get_one::<String>("out")
@@ -70,6 +79,12 @@ fn run() -> Result<(), String> {
         }
         #[cfg(feature = "video")]
         (None, None, None, Some(v), None) => {
+            let motion_json = matches.get_one::<String>("motion-json").map(String::as_str);
+            if motion_json.is_some() && auto_direction.is_none() {
+                return Err(
+                    "--motion-json requires --video with -d auto or -d auto-reverse".into(),
+                );
+            }
             let encoder = match matches
                 .get_one::<String>("encoder")
                 .expect("clap provides a default encoder")
@@ -87,6 +102,13 @@ fn run() -> Result<(), String> {
                 "hardware" => video::DecoderChoice::Hardware,
                 _ => video::DecoderChoice::Cpu,
             };
+            let direction = match auto_direction {
+                Some(reverse) => video::DirectionChoice::Auto { reverse },
+                None => video::DirectionChoice::Fixed(
+                    VideoDirection::from_str(direction_name)
+                        .expect("clap restricts --video-direction to valid values"),
+                ),
+            };
             let report = video::convert_video_to_anaglyph(
                 v,
                 output,
@@ -98,10 +120,25 @@ fn run() -> Result<(), String> {
             println!("decoder: {}", report.decoder);
             println!("blend:   {}", report.blender);
             println!("encoder: {}", report.encoder);
+            for reversal in &report.reversals {
+                println!(
+                    "reversal at {:.2}s (frame {}): {} -> {}",
+                    reversal.time,
+                    reversal.frame,
+                    reversal.from.name(),
+                    reversal.to.name()
+                );
+            }
             println!("encoded {} frames", report.frames);
+            if let Some(path) = motion_json {
+                write_motion_json(path, &report)?;
+                println!("motion timeline: {path}");
+            }
             Ok(())
         }
         (None, None, None, None, Some(g)) => {
+            let direction = VideoDirection::from_str(direction_name)
+                .expect("clap restricts --video-direction to valid values");
             convert_gif_to_anaglyph(g, output, direction, anaglyph_type)
         }
         #[cfg(not(feature = "video"))]
@@ -160,4 +197,55 @@ fn save_image(image: &DynamicImage, path: &str) -> Result<(), String> {
     image
         .save(path)
         .map_err(|e| format!("failed to save {path}: {e}"))
+}
+
+/// Write the detected motion timeline as a JSON file. The schema is small and
+/// fixed, so it is emitted directly rather than pulling in a serde
+/// dependency for one report.
+#[cfg(feature = "video")]
+fn write_motion_json(path: &str, report: &video::ConversionReport) -> Result<(), String> {
+    let reversals: Vec<String> = report
+        .reversals
+        .iter()
+        .map(|r| {
+            format!(
+                "    {{ \"frame\": {}, \"time\": {:.3}, \"from\": \"{}\", \"to\": \"{}\" }}",
+                r.frame,
+                r.time,
+                r.from.name(),
+                r.to.name()
+            )
+        })
+        .collect();
+    let frames: Vec<String> = report
+        .motion
+        .iter()
+        .map(|p| {
+            let trend = match p.trend {
+                Some(anaglyph_rs::motion::Trend::Increasing) => "\"increasing\"",
+                Some(anaglyph_rs::motion::Trend::Decreasing) => "\"decreasing\"",
+                None => "null",
+            };
+            format!(
+                "    {{ \"frame\": {}, \"time\": {:.3}, \"dx\": {:.4}, \"reliable\": {}, \"trend\": {} }}",
+                p.frame, p.time, p.dx, p.reliable, trend
+            )
+        })
+        .collect();
+    let json = format!(
+        "{{\n  \"reversals\": {},\n  \"frames\": {}\n}}\n",
+        json_array(&reversals),
+        json_array(&frames)
+    );
+    std::fs::write(path, json).map_err(|e| format!("failed to write {path}: {e}"))
+}
+
+/// A JSON array of pre-rendered entries, one per line (or `[]` when empty).
+#[cfg(feature = "video")]
+fn json_array(entries: &[String]) -> String {
+    if entries.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[\n{}\n  ]", entries.join(",\n"))
+    }
 }
