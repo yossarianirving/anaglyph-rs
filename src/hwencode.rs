@@ -91,6 +91,11 @@ pub struct VaapiEncoder {
     time_base: Rational,
     /// Time base the muxer picked for the stream (valid after header write).
     stream_tb: Rational,
+    /// Frames successfully submitted to the encoder. Flushing an encoder
+    /// that never received a frame crashes FFmpeg's h264_vaapi (its
+    /// internal state is only initialized on the first frame), so `finish`
+    /// must know whether there is anything to flush.
+    frames_sent: usize,
     header_written: bool,
     trailer_written: bool,
 }
@@ -124,6 +129,7 @@ impl VaapiEncoder {
             stream_index: 0,
             time_base,
             stream_tb: Rational(0, 1),
+            frames_sent: 0,
             header_written: false,
             trailer_written: false,
         };
@@ -349,6 +355,7 @@ impl VaapiEncoder {
                 check(ret, "send_frame")?;
                 break;
             }
+            self.frames_sent += 1;
             self.drain_packets().map(|_| ())
         }
     }
@@ -357,6 +364,15 @@ impl VaapiEncoder {
     /// drop if not invoked explicitly.
     pub fn finish(&mut self) -> Result<()> {
         if self.trailer_written {
+            return Ok(());
+        }
+        if self.frames_sent == 0 {
+            // Nothing was ever encoded: there is no pipeline to flush, and
+            // FFmpeg's h264_vaapi segfaults when a NULL flush reaches an
+            // encoder that never saw a frame. Leave the header-only file
+            // behind (the caller's run failed and removes it) and mark the
+            // trailer handled so `Drop` does not retry the flush.
+            self.trailer_written = true;
             return Ok(());
         }
         unsafe {

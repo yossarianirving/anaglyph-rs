@@ -361,7 +361,36 @@ impl Pairer {
     }
 }
 
+/// Convert a video into an anaglyph video, cleaning up after a failed run.
+///
+/// A failure after the encoder opened the output file would otherwise leave
+/// a truncated, unplayable file (or an empty stub) behind; when the file was
+/// created by this call, it is removed. A pre-existing file is left alone.
 pub fn convert_video_to_anaglyph(
+    video: &str,
+    video_out: &str,
+    direction: DirectionChoice,
+    anaglyph_type: AnaglyphType,
+    decoder_choice: DecoderChoice,
+    encoder_choice: EncoderChoice,
+) -> Result<ConversionReport, String> {
+    let out = Path::new(video_out);
+    let pre_existing = out.exists();
+    let result = convert_video(
+        video,
+        video_out,
+        direction,
+        anaglyph_type,
+        decoder_choice,
+        encoder_choice,
+    );
+    if result.is_err() && !pre_existing {
+        let _ = std::fs::remove_file(out);
+    }
+    result
+}
+
+fn convert_video(
     video: &str,
     video_out: &str,
     direction: DirectionChoice,
@@ -535,12 +564,21 @@ pub fn convert_video_to_anaglyph(
         Err(_) => Err("encode thread panicked".into()),
     };
     // The channel receiver is gone, so the decode thread is unwinding too.
-    let _ = decode_thread.join();
+    // A panic inside the decoder (video-rs or FFmpeg bindings) drops the
+    // sender just like a clean end of stream would, so the join result is
+    // the only way to tell "stream ended" from "reader crashed mid-file".
+    let decode_ok = decode_thread.join().is_ok();
 
     encode_result?;
     if let Some(e) = decode_error {
         return Err(format!(
             "decoding stopped early after {frame_count} frames: {e}"
+        ));
+    }
+    if !decode_ok {
+        return Err(format!(
+            "the decoder crashed while reading {video}; \
+             the file may be corrupt (run with RUST_BACKTRACE=1 for details)"
         ));
     }
     if frame_count == 0 {

@@ -3,6 +3,7 @@ use image::codecs::gif::{GifDecoder, GifEncoder};
 use image::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
+use std::path::Path;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -241,12 +242,23 @@ pub fn convert_gif_to_anaglyph(
     // Call buffer-based function
     let out_data = convert_gif_buffer_to_anaglyph(&gif_data, direction, anaglyph_type)?;
 
-    // Write output buffer to file
-    let mut output_file =
-        File::create(gif_out).map_err(|e| format!("failed to create {gif_out}: {e}"))?;
-    output_file
-        .write_all(&out_data)
-        .map_err(|e| format!("failed to write {gif_out}: {e}"))?;
+    // Write output buffer to file. As in the video path, a write that dies
+    // halfway would leave a corrupt file behind: when we created it, remove
+    // it again. (A pre-existing file was already truncated by `create`.)
+    // The `File` closes at the end of this statement, before the unlink.
+    let pre_existing = Path::new(gif_out).exists();
+    let written = File::create(gif_out)
+        .map_err(|e| format!("failed to create {gif_out}: {e}"))
+        .and_then(|mut file| {
+            file.write_all(&out_data)
+                .map_err(|e| format!("failed to write {gif_out}: {e}"))
+        });
+    if let Err(e) = written {
+        if !pre_existing {
+            let _ = std::fs::remove_file(gif_out);
+        }
+        return Err(e);
+    }
     Ok(())
 }
 

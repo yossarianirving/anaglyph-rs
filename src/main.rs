@@ -4,10 +4,32 @@ use anaglyph_rs::gif::convert_gif_to_anaglyph;
 use anaglyph_rs::video;
 use clap::{arg, command, value_parser};
 use image::{imageops, DynamicImage, ImageReader, RgbImage};
+use std::path::Path;
 use std::str::FromStr;
 
 fn main() {
-    if let Err(e) = run() {
+    // Safety net: a panic (ours or a dependency's, e.g. deep inside the
+    // FFmpeg bindings on a pathological file) should still exit as a
+    // reported error rather than a crash. Panics on worker threads are
+    // caught by `JoinHandle` and surfaced as errors instead; this covers
+    // the main thread. The default panic hook has already printed the
+    // panic location before this runs.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    let outcome = match result {
+        Ok(inner) => inner,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            // The default hook prints the panic site but not a backtrace by
+            // default; point at the switch that gets one.
+            eprintln!("hint: re-run with RUST_BACKTRACE=1 for details");
+            Err(format!("unexpected internal error: {msg}"))
+        }
+    };
+    if let Err(e) = outcome {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -67,6 +89,13 @@ fn run() -> Result<(), String> {
     let output = matches
         .get_one::<String>("out")
         .expect("output is required");
+    // Fail before opening inputs and initializing the GPU when the output
+    // simply cannot be written, with a message naming the real problem.
+    if let Some(dir) = Path::new(output).parent() {
+        if !dir.as_os_str().is_empty() && !dir.is_dir() {
+            return Err(format!("output directory {} does not exist", dir.display()));
+        }
+    }
 
     match (left, right, stereo, video, gif) {
         (Some(l), Some(r), None, None, None) => {
