@@ -2,7 +2,7 @@
 use std::io::Cursor;
 use std::time::Instant;
 
-use anaglyph_rs::anaglyph::{anaglyph_type_to_matrix, AnaglyphType};
+use anaglyph_rs::anaglyph::{anaglyph_type_to_matrix, AnaglyphType, BlenderChoice};
 use anaglyph_rs::gif;
 use anaglyph_rs::gpu::GpuBlender;
 use image::{AnimationDecoder, Frame, ImageDecoder};
@@ -70,6 +70,7 @@ fn main() {
         &data,
         anaglyph_rs::anaglyph::VideoDirection::Clockwise,
         AnaglyphType::Color,
+        BlenderChoice::Auto,
     )
     .expect("convert");
     println!(

@@ -11,7 +11,9 @@ use video_rs::ffmpeg::Rational;
 use video_rs::hwaccel::HardwareAccelerationDeviceType;
 use video_rs::Time;
 
-use crate::anaglyph::{anaglyph_type_to_matrix, combine_slices, AnaglyphType, VideoDirection};
+use crate::anaglyph::{
+    anaglyph_type_to_matrix, combine_slices, AnaglyphType, BlenderChoice, VideoDirection,
+};
 use crate::gpu::GpuBlender;
 use crate::hwencode::{EncodeOptions, VaapiEncoder};
 use crate::motion::{DirectionTracker, MotionEstimator, MotionSample, Trend};
@@ -373,6 +375,7 @@ pub fn convert_video_to_anaglyph(
     anaglyph_type: AnaglyphType,
     decoder_choice: DecoderChoice,
     encoder_choice: EncoderChoice,
+    blend: BlenderChoice,
 ) -> Result<ConversionReport, String> {
     let out = Path::new(video_out);
     let pre_existing = out.exists();
@@ -383,6 +386,7 @@ pub fn convert_video_to_anaglyph(
         anaglyph_type,
         decoder_choice,
         encoder_choice,
+        blend,
     );
     if result.is_err() && !pre_existing {
         let _ = std::fs::remove_file(out);
@@ -397,6 +401,7 @@ fn convert_video(
     anaglyph_type: AnaglyphType,
     decoder_choice: DecoderChoice,
     encoder_choice: EncoderChoice,
+    blend: BlenderChoice,
 ) -> Result<ConversionReport, String> {
     video_rs::init().map_err(|e| format!("failed to initialize ffmpeg: {e}"))?;
 
@@ -429,11 +434,20 @@ fn convert_video(
         create_backend(encoder_choice, video_out, width, height, decoder_time_base)?;
 
     let anaglyph_matrix = anaglyph_type_to_matrix(anaglyph_type);
-    let (mut blender, mut blender_name) =
-        match GpuBlender::new(video_size.0, video_size.1, anaglyph_matrix) {
-            Ok(b) => (Some(b), "GPU (wgpu)".to_string()),
-            Err(e) => (None, format!("CPU (rayon, GPU unavailable: {e})")),
-        };
+    // The `video` feature implies `gpu`, so a GPU blender is always tryable
+    // here; `Cpu` skips the (not free) adapter initialization entirely.
+    let (mut blender, mut blender_name) = match blend {
+        BlenderChoice::Cpu => (None, "CPU (rayon, CPU blending selected)".to_string()),
+        BlenderChoice::Auto | BlenderChoice::Gpu => {
+            match GpuBlender::new(video_size.0, video_size.1, anaglyph_matrix) {
+                Ok(b) => (Some(b), "GPU (wgpu)".to_string()),
+                Err(e) if blend == BlenderChoice::Gpu => {
+                    return Err(format!("GPU blending requested but unavailable: {e}"))
+                }
+                Err(e) => (None, format!("CPU (rayon, GPU unavailable: {e})")),
+            }
+        }
+    };
 
     let mut pairer = match direction {
         DirectionChoice::Fixed(d) => Pairer::fixed(d),

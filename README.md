@@ -91,7 +91,15 @@ depth is inverted) your rig's rotation runs opposite to the assumed
 convention: `-d auto-reverse` flips the detected pairing. Auto mode adds about
 0.5 ms per frame of analysis, which is hidden inside the decode step.
 
-Two flags control the hardware pipeline for video: `-e/--encoder auto|hardware|software` selects the output encoder (`auto`, the default, prefers VAAPI and falls back to libx264), and `-D/--decode cpu|hardware` selects the decoder (CPU is the default; see the benchmark note above).
+The blend backend is chosen with `-b/--blend auto|gpu|cpu` (applies to video
+and gif; images always blend on the CPU). `auto`, the default, prefers the
+`wgpu` compute shader and falls back to the parallel CPU blend when no GPU is
+available; `cpu` forces the CPU (skipping GPU setup entirely); `gpu` requires
+the GPU and reports an error instead of silently downgrading. The two backends
+produce identical pixels, so the choice is purely about speed and about
+reproducing CPU-only behavior.
+
+Three flags control the hardware pipeline for video: `-e/--encoder auto|hardware|software` selects the output encoder (`auto`, the default, prefers VAAPI and falls back to libx264), `-D/--decode cpu|hardware` selects the decoder (CPU is the default; see the benchmark note above), and `-b/--blend` (see above).
 
 To debug or tune detection, `--motion-json timeline.json` (with `-d auto`)
 writes the per-frame motion trace — measured drift, whether the frame matched

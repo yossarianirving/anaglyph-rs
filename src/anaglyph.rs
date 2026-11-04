@@ -75,6 +75,48 @@ impl FromStr for VideoDirection {
     }
 }
 
+/// Which backend blends the eye pixels.
+///
+/// Applies to the animated inputs (video and gif), which run the blend per
+/// frame; images are always blended on the CPU. Builds without the `gpu`
+/// feature have no GPU path at all, so [`Gpu`](BlenderChoice::Gpu) fails
+/// with an explanatory error there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlenderChoice {
+    /// Prefer GPU (wgpu) blending, fall back to the CPU when unavailable.
+    #[default]
+    Auto,
+    /// Require GPU (wgpu) blending; fail if unavailable.
+    Gpu,
+    /// Always blend on the CPU.
+    Cpu,
+}
+
+impl BlenderChoice {
+    pub fn name(self) -> &'static str {
+        match self {
+            BlenderChoice::Auto => "auto",
+            BlenderChoice::Gpu => "gpu",
+            BlenderChoice::Cpu => "cpu",
+        }
+    }
+}
+
+impl FromStr for BlenderChoice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(BlenderChoice::Auto),
+            "gpu" => Ok(BlenderChoice::Gpu),
+            "cpu" => Ok(BlenderChoice::Cpu),
+            other => Err(format!(
+                "unknown blend mode: {other} (expected auto, gpu or cpu)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Offset {
     pub x: i32,
@@ -368,7 +410,12 @@ mod tests {
             "counter-clockwise".parse::<VideoDirection>().unwrap(),
             VideoDirection::CounterClockwise
         );
+        for choice in [BlenderChoice::Auto, BlenderChoice::Gpu, BlenderChoice::Cpu] {
+            assert_eq!(choice.name().parse::<BlenderChoice>().unwrap(), choice);
+        }
+        assert_eq!(BlenderChoice::default(), BlenderChoice::Auto);
         assert!("sepia".parse::<AnaglyphType>().is_err());
         assert!("sideways".parse::<VideoDirection>().is_err());
+        assert!("turbo".parse::<BlenderChoice>().is_err());
     }
 }

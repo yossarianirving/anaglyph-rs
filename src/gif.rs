@@ -1,4 +1,6 @@
-use crate::anaglyph::{anaglyph_type_to_matrix, combine_slices, AnaglyphType, VideoDirection};
+use crate::anaglyph::{
+    anaglyph_type_to_matrix, combine_slices, AnaglyphType, BlenderChoice, VideoDirection,
+};
 use image::codecs::gif::{GifDecoder, GifEncoder};
 use image::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
 use std::fs::File;
@@ -20,12 +22,16 @@ use crate::gpu::GpuBlender;
 ///
 /// Native builds with the `gpu` feature blend on the GPU (falling back to
 /// the CPU when no device is available); other targets blend on the CPU.
+/// `blend` forces one backend or the other; [`BlenderChoice::Gpu`] fails
+/// rather than silently downgrading.
+///
 /// On wasm, prefer [`convert_gif_buffer_to_anaglyph_async`], which can use
 /// WebGPU without blocking the browser's event loop.
 pub fn convert_gif_buffer_to_anaglyph(
     gif_data: &[u8],
     direction: VideoDirection,
     anaglyph_type: AnaglyphType,
+    blend: BlenderChoice,
 ) -> Result<Vec<u8>, String> {
     let cursor_in = Cursor::new(gif_data);
     let decoder = GifDecoder::new(cursor_in).map_err(|e| format!("failed to decode gif: {e}"))?;
@@ -42,9 +48,27 @@ pub fn convert_gif_buffer_to_anaglyph(
     let mut previous_frame = first_frame;
 
     // GPU blending when available (native builds with the `gpu` feature);
-    // any setup failure (no adapter, oversized frame) falls back to CPU.
+    // under `Auto` any setup failure (no adapter, oversized frame) falls
+    // back to CPU, under `Gpu` it is an error, under `Cpu` the blender is
+    // never created.
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    let mut gpu = GpuBlender::new(gif_size.0, gif_size.1, anaglyph_matrix).ok();
+    let mut gpu = match blend {
+        BlenderChoice::Cpu => None,
+        BlenderChoice::Auto => GpuBlender::new(gif_size.0, gif_size.1, anaglyph_matrix).ok(),
+        BlenderChoice::Gpu => Some(
+            GpuBlender::new(gif_size.0, gif_size.1, anaglyph_matrix)
+                .map_err(|e| format!("GPU blending requested but unavailable: {e}"))?,
+        ),
+    };
+    // Without a compiled GPU path there is nothing to select; only `Gpu`
+    // (an explicit request) is a mistake worth reporting.
+    #[cfg(not(all(feature = "gpu", not(target_arch = "wasm32"))))]
+    if blend == BlenderChoice::Gpu {
+        return Err(
+            "GPU blending requested but this build has no GPU support (build with `--features gpu`)"
+                .into(),
+        );
+    }
 
     let mut new_frames = Vec::<Frame>::new();
     for frame in frames {
@@ -224,13 +248,14 @@ fn encode_anaglyph(new_frames: Vec<Frame>) -> Result<Vec<u8>, String> {
     Ok(out_buffer)
 }
 
-/// Wrapper function for file-based usage.
-/// Retains the original signature and calls the buffer-based function.
+/// Wrapper function for file-based usage: decodes, blends each frame pair
+/// (per `blend`), and writes the result.
 pub fn convert_gif_to_anaglyph(
     gif: &str,
     gif_out: &str,
     direction: VideoDirection,
     anaglyph_type: AnaglyphType,
+    blend: BlenderChoice,
 ) -> Result<(), String> {
     // Read input file into buffer
     let mut input_file = File::open(gif).map_err(|e| format!("failed to open {gif}: {e}"))?;
@@ -240,7 +265,7 @@ pub fn convert_gif_to_anaglyph(
         .map_err(|e| format!("failed to read {gif}: {e}"))?;
 
     // Call buffer-based function
-    let out_data = convert_gif_buffer_to_anaglyph(&gif_data, direction, anaglyph_type)?;
+    let out_data = convert_gif_buffer_to_anaglyph(&gif_data, direction, anaglyph_type, blend)?;
 
     // Write output buffer to file. As in the video path, a write that dies
     // halfway would leave a corrupt file behind: when we created it, remove
@@ -291,6 +316,7 @@ mod tests {
             b"not a gif",
             VideoDirection::Clockwise,
             AnaglyphType::Color,
+            BlenderChoice::Auto,
         );
         assert!(err.is_err());
     }
@@ -316,9 +342,13 @@ mod tests {
             .unwrap();
         }
 
-        let out =
-            convert_gif_buffer_to_anaglyph(&buf, VideoDirection::Clockwise, AnaglyphType::Color)
-                .expect("conversion");
+        let out = convert_gif_buffer_to_anaglyph(
+            &buf,
+            VideoDirection::Clockwise,
+            AnaglyphType::Color,
+            BlenderChoice::Auto,
+        )
+        .expect("conversion");
 
         let dec = GifDecoder::new(Cursor::new(&out)).unwrap();
         let delays: Vec<u32> = dec
@@ -336,8 +366,12 @@ mod tests {
             enc.encode_frame(solid(image::Rgba([1, 2, 3, 255]), 100))
                 .unwrap();
         }
-        let result =
-            convert_gif_buffer_to_anaglyph(&buf, VideoDirection::Clockwise, AnaglyphType::Color);
+        let result = convert_gif_buffer_to_anaglyph(
+            &buf,
+            VideoDirection::Clockwise,
+            AnaglyphType::Color,
+            BlenderChoice::Auto,
+        );
         assert!(matches!(result, Err(e) if e.contains("at least two frames")));
     }
 }

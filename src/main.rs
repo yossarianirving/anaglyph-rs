@@ -1,4 +1,6 @@
-use anaglyph_rs::anaglyph::{left_right_to_anaglyph_offset, AnaglyphType, Offset, VideoDirection};
+use anaglyph_rs::anaglyph::{
+    left_right_to_anaglyph_offset, AnaglyphType, BlenderChoice, Offset, VideoDirection,
+};
 use anaglyph_rs::gif::convert_gif_to_anaglyph;
 #[cfg(feature = "video")]
 use anaglyph_rs::video;
@@ -50,6 +52,7 @@ fn run() -> Result<(), String> {
         .arg(arg!(--"motion-json" <FILE> "Write the detected motion timeline to a JSON file (requires --video with -d auto)").required(false))
         .arg(arg!(-e --encoder <ENCODER> "Video encoder backend (auto, hardware, or software)").required(false).value_parser(["auto", "hardware", "software"]).default_value("auto"))
         .arg(arg!(-D --decode <DECODER> "Video decoder mode (cpu or hardware)").required(false).value_parser(["cpu", "hardware"]).default_value("cpu"))
+        .arg(arg!(-b --blend <BLEND> "Blend backend for video and gif (auto, gpu, or cpu); images always blend on the CPU").required(false).value_parser(["auto", "gpu", "cpu"]).default_value("auto"))
         .get_matches();
 
     // clap already restricts these to the values the FromStr impls accept.
@@ -72,6 +75,8 @@ fn run() -> Result<(), String> {
         x: *matches.get_one::<i32>("offset-x").expect("clap default"),
         y: *matches.get_one::<i32>("offset-y").expect("clap default"),
     };
+    let blend = BlenderChoice::from_str(matches.get_one::<String>("blend").expect("clap default"))
+        .expect("clap restricts --blend to valid values");
 
     let (left, right, stereo, video, gif) = (
         matches.get_one::<String>("left"),
@@ -83,6 +88,12 @@ fn run() -> Result<(), String> {
     if auto_direction.is_some() && video.is_none() {
         return Err(
             "automatic direction (-d auto / auto-reverse) is only supported with --video".into(),
+        );
+    }
+    if blend == BlenderChoice::Gpu && (left.is_some() || stereo.is_some()) {
+        return Err(
+            "--blend gpu applies only to --video and --gif; images are always blended on the CPU"
+                .into(),
         );
     }
 
@@ -145,6 +156,7 @@ fn run() -> Result<(), String> {
                 anaglyph_type,
                 decoder,
                 encoder,
+                blend,
             )?;
             println!("decoder: {}", report.decoder);
             println!("blend:   {}", report.blender);
@@ -168,7 +180,7 @@ fn run() -> Result<(), String> {
         (None, None, None, None, Some(g)) => {
             let direction = VideoDirection::from_str(direction_name)
                 .expect("clap restricts --video-direction to valid values");
-            convert_gif_to_anaglyph(g, output, direction, anaglyph_type)
+            convert_gif_to_anaglyph(g, output, direction, anaglyph_type, blend)
         }
         #[cfg(not(feature = "video"))]
         (_, _, _, Some(_), None) => {
