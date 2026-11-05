@@ -15,7 +15,7 @@ use crate::anaglyph::{
     anaglyph_type_to_matrix, combine_slices, AnaglyphType, BlenderChoice, VideoDirection,
 };
 use crate::gpu::GpuBlender;
-use crate::hwencode::{EncodeOptions, VaapiEncoder};
+use crate::hwencode::{self, EncodeOptions, HwCodec, HwEncoder};
 use crate::motion::{DirectionTracker, MotionEstimator, MotionSample, Trend};
 
 /// Device types to try for hardware-accelerated decoding, in order.
@@ -38,18 +38,24 @@ const DECODE_QUEUE_DEPTH: usize = 8;
 /// Which encoder backend to use for the output video.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EncoderChoice {
-    /// Prefer the hardware (VAAPI) encoder, fall back to software.
+    /// Prefer a hardware encoder (currently VAAPI), fall back to software.
     Auto,
-    /// Require the hardware (VAAPI) encoder; fail if unavailable.
+    /// Require a hardware encoder; fail if none is available.
     Hardware,
     /// Always use the software (libx264) encoder.
     Software,
 }
 
+/// Hardware encoders tried by [`EncoderChoice::Auto`] and
+/// [`EncoderChoice::Hardware`], in order of preference. VAAPI is currently
+/// the only backend; when more are added to [`hwencode`], this list grows
+/// (and may diverge per target OS — native hardware first).
+const HARDWARE_ORDER: [HwCodec; 1] = [HwCodec::Vaapi];
+
 /// The active encoding backend.
 enum Backend {
     Software(Box<Encoder>),
-    Hardware(Box<VaapiEncoder>),
+    Hardware(Box<dyn HwEncoder>),
 }
 
 impl Backend {
@@ -647,19 +653,6 @@ fn create_backend(
     height: usize,
     decoder_time_base: Rational,
 ) -> Result<(Backend, String), String> {
-    let hardware = || -> Result<(Backend, String), String> {
-        let encoder = VaapiEncoder::new(
-            Path::new(video_out),
-            width as u32,
-            height as u32,
-            decoder_time_base,
-            EncodeOptions::default(),
-        )?;
-        Ok((
-            Backend::Hardware(Box::new(encoder)),
-            "VAAPI (h264_vaapi)".to_string(),
-        ))
-    };
     let software = || -> Result<(Backend, String), String> {
         let settings = Settings::preset_h264_yuv420p(width, height, false);
         let encoder = Encoder::new(Path::new(video_out), settings)
@@ -672,17 +665,44 @@ fn create_backend(
 
     match choice {
         EncoderChoice::Software => software(),
-        EncoderChoice::Hardware => hardware(),
-        EncoderChoice::Auto => match hardware() {
-            Ok(ok) => Ok(ok),
-            Err(e) => software().map(|(backend, _)| {
-                (
-                    backend,
-                    format!("software (libx264, VAAPI unavailable: {e})"),
-                )
-            }),
-        },
+        EncoderChoice::Hardware | EncoderChoice::Auto => {
+            let mut reasons = Vec::new();
+            for kind in HARDWARE_ORDER {
+                match open_hardware(kind, video_out, width, height, decoder_time_base) {
+                    Ok(ok) => return Ok(ok),
+                    Err(e) => reasons.push(format!("{} unavailable: {e}", kind.display())),
+                }
+            }
+            let tried = reasons.join("; ");
+            if choice == EncoderChoice::Hardware {
+                Err(format!("no hardware encoder available ({tried})"))
+            } else {
+                software().map(|(backend, _)| (backend, format!("software (libx264, {tried})")))
+            }
+        }
     }
+}
+
+/// Open one hardware encoder, reporting which one was chosen.
+fn open_hardware(
+    kind: HwCodec,
+    video_out: &str,
+    width: usize,
+    height: usize,
+    decoder_time_base: Rational,
+) -> Result<(Backend, String), String> {
+    let encoder = hwencode::open(
+        kind,
+        Path::new(video_out),
+        width as u32,
+        height as u32,
+        decoder_time_base,
+        EncodeOptions::default(),
+    )?;
+    Ok((
+        Backend::Hardware(encoder),
+        format!("{} ({})", kind.display(), kind.ffmpeg_name()),
+    ))
 }
 
 /// CPU fallback for blending two dense RGB24 frames, parallelized with rayon.

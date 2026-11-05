@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use anaglyph_rs::anaglyph::{anaglyph_type_to_matrix, AnaglyphType};
 use anaglyph_rs::gpu::GpuBlender;
-use anaglyph_rs::hwencode::{EncodeOptions, VaapiEncoder};
+use anaglyph_rs::hwencode::{self, EncodeOptions, HwCodec};
 use ndarray::Array3;
 use video_rs::decode::DecoderBuilder;
 use video_rs::encode::{Encoder, Settings};
@@ -213,7 +213,7 @@ fn main() {
         let (c0u, c0s) = cpu_time();
         let t = Instant::now();
         let result = (|| -> Result<(), String> {
-            let mut enc = VaapiEncoder::new(&hw_path, w, h, fps_tb, opts)?;
+            let mut enc = hwencode::open(HwCodec::Vaapi, &hw_path, w, h, fps_tb, opts)?;
             for (i, f) in frames.iter().enumerate() {
                 enc.encode(f, i as i64)?;
             }
