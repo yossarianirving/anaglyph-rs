@@ -161,6 +161,7 @@ fn run() -> Result<(), String> {
             println!("decoder: {}", report.decoder);
             println!("blend:   {}", report.blender);
             println!("encoder: {}", report.encoder);
+            println!("audio:   {}", report.audio);
             for reversal in &report.reversals {
                 println!(
                     "reversal at {:.2}s (frame {}): {} -> {}",

@@ -101,6 +101,18 @@ reproducing CPU-only behavior.
 
 Three flags control the hardware pipeline for video: `-e/--encoder auto|hardware|software` selects the output encoder (`auto`, the default, prefers VAAPI and falls back to libx264), `-D/--decode cpu|hardware` selects the decoder (CPU is the default; see the benchmark note above), and `-b/--blend` (see above).
 
+The source audio track is carried into the output video. Since the encoders
+write video-only MP4s, a post-encode remux pass copies the finished video
+stream and the best source audio stream into the output container: the audio
+is stream-copied when MP4 accepts the source codec (AAC, and Opus on recent
+FFmpeg builds) and transcoded to 128 kbit/s 48 kHz AAC otherwise. The pass is
+best-effort: any failure leaves the video-only output untouched and is
+reported, never turning a completed conversion into an error. Each conversion
+prints what happened, e.g. `audio:   opus (stream copy)`,
+`audio:   aac (transcoded from pcm_s16le; ...)`,
+`audio:   none (source has no audio track)`, or `audio:   dropped (...)`
+with the reason when the audio could not be attached.
+
 To debug or tune detection, `--motion-json timeline.json` (with `-d auto`)
 writes the per-frame motion trace — measured drift, whether the frame matched
 reliably, the detected trend, and the reversal points — as JSON.

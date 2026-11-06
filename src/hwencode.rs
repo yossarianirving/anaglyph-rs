@@ -191,10 +191,10 @@ pub fn open(
     }
 }
 
-type Result<T> = std::result::Result<T, String>;
+pub(crate) type Result<T> = std::result::Result<T, String>;
 
 /// Convert a negative FFmpeg error code into a message.
-fn err_str(code: c_int) -> String {
+pub(crate) fn err_str(code: c_int) -> String {
     let mut buf = [0u8; 256];
     unsafe {
         ffi::av_strerror(code, buf.as_mut_ptr() as *mut c_char, buf.len());
@@ -204,7 +204,7 @@ fn err_str(code: c_int) -> String {
 }
 
 /// Check an FFmpeg return code.
-fn check(code: c_int, what: &str) -> Result<()> {
+pub(crate) fn check(code: c_int, what: &str) -> Result<()> {
     if code < 0 {
         Err(format!("{}: {}", what, err_str(code)))
     } else {
@@ -768,6 +768,75 @@ fn first_dict_key(dict: *mut ffi::AVDictionary) -> String {
     }
 }
 
+/// A minimal no-device backend that encodes the NV12 frames the scaler
+/// produces with `libx264` — exactly the shape an NVENC or VideoToolbox
+/// backend would take (see the module docs). It exercises the whole generic
+/// pipeline, mux included, on machines without any GPU encoder, and doubles
+/// as a video-only fixture generator for tests in other modules.
+#[cfg(test)]
+pub(crate) struct SoftwareBackend;
+
+#[cfg(test)]
+unsafe impl Send for SoftwareBackend {}
+
+#[cfg(test)]
+impl HwBackend for SoftwareBackend {
+    fn ffmpeg_name(&self) -> &'static str {
+        "libx264"
+    }
+
+    fn init_device(&mut self, _width: u32, _height: u32, _options: &EncodeOptions) -> Result<()> {
+        Ok(())
+    }
+
+    unsafe fn configure_context(
+        &self,
+        ctx: *mut ffi::AVCodecContext,
+        _options: &EncodeOptions,
+        _dict: &mut *mut ffi::AVDictionary,
+    ) -> Result<()> {
+        (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+        Ok(())
+    }
+
+    unsafe fn acquire_frame(
+        &mut self,
+        nv12: *mut ffi::AVFrame,
+        pts: i64,
+    ) -> Result<*mut ffi::AVFrame> {
+        (*nv12).pts = pts;
+        Ok(nv12)
+    }
+}
+
+/// Whether the `libx264` encoder exists in this FFmpeg build (tests skip
+/// quietly on stripped builds).
+#[cfg(test)]
+pub(crate) fn software_encoder_available() -> bool {
+    let name = CString::new("libx264").unwrap();
+    unsafe { !ffi::avcodec_find_encoder_by_name(name.as_ptr()).is_null() }
+}
+
+/// Write a tiny flat-grey video-only MP4 (`frames` frames at 25 fps), used
+/// as the encode target in tests that exercise container-level behavior.
+#[cfg(test)]
+pub(crate) fn make_test_video(path: &Path, frames: i64) -> Result<()> {
+    let mut enc = Driver::new(
+        SoftwareBackend,
+        path,
+        16,
+        16,
+        Rational(1, 25),
+        EncodeOptions::default(),
+    )?;
+    for pts in 0..frames {
+        enc.encode(&[7u8; 16 * 16 * 3], pts)?;
+    }
+    enc.finish()?;
+    drop(enc);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,54 +847,9 @@ mod tests {
         assert_eq!(HwCodec::Vaapi.display(), "VAAPI");
     }
 
-    /// A minimal no-device backend that encodes the NV12 frames the scaler
-    /// produces with `libx264` — exactly the shape an NVENC or
-    /// VideoToolbox backend would take (see the module docs). It exercises
-    /// the whole generic pipeline, mux included, on machines without any
-    /// GPU encoder.
-    struct SoftwareBackend;
-
-    unsafe impl Send for SoftwareBackend {}
-
-    impl HwBackend for SoftwareBackend {
-        fn ffmpeg_name(&self) -> &'static str {
-            "libx264"
-        }
-
-        fn init_device(
-            &mut self,
-            _width: u32,
-            _height: u32,
-            _options: &EncodeOptions,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        unsafe fn configure_context(
-            &self,
-            ctx: *mut ffi::AVCodecContext,
-            _options: &EncodeOptions,
-            _dict: &mut *mut ffi::AVDictionary,
-        ) -> Result<()> {
-            (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
-            Ok(())
-        }
-
-        unsafe fn acquire_frame(
-            &mut self,
-            nv12: *mut ffi::AVFrame,
-            pts: i64,
-        ) -> Result<*mut ffi::AVFrame> {
-            (*nv12).pts = pts;
-            Ok(nv12)
-        }
-    }
-
     #[test]
     fn driver_pipeline_with_system_memory_backend() {
-        // libx264 is unavailable in stripped FFmpeg builds; skip quietly.
-        let name = CString::new("libx264").unwrap();
-        if unsafe { ffi::avcodec_find_encoder_by_name(name.as_ptr()) }.is_null() {
+        if !software_encoder_available() {
             return;
         }
         let dir = std::env::temp_dir().join("anaglyph-hwencode-tests");
@@ -833,20 +857,7 @@ mod tests {
         let path = dir.join("system-memory.mp4");
         let _ = std::fs::remove_file(&path);
 
-        let mut enc = Driver::new(
-            SoftwareBackend,
-            &path,
-            16,
-            16,
-            Rational(1, 25),
-            EncodeOptions::default(),
-        )
-        .unwrap();
-        for pts in 0..4 {
-            enc.encode(&[7u8; 16 * 16 * 3], pts).unwrap();
-        }
-        enc.finish().unwrap();
-        drop(enc);
+        make_test_video(&path, 4).unwrap();
 
         // A finished, non-trivial mp4 came out of the generic pipeline.
         let bytes = std::fs::read(&path).unwrap();
@@ -857,8 +868,7 @@ mod tests {
     #[test]
     fn empty_run_finishes_without_flushing() {
         // The guard against crashing an encoder that never saw a frame.
-        let name = CString::new("libx264").unwrap();
-        if unsafe { ffi::avcodec_find_encoder_by_name(name.as_ptr()) }.is_null() {
+        if !software_encoder_available() {
             return;
         }
         let dir = std::env::temp_dir().join("anaglyph-hwencode-tests");

@@ -106,6 +106,10 @@ pub struct ConversionReport {
     pub blender: String,
     /// Encoder used, e.g. `"VAAPI (h264_vaapi)"` or a fallback with the reason.
     pub encoder: String,
+    /// How the source audio was carried into the output, e.g.
+    /// `"opus (stream copy)"`, `"aac (transcoded from vorbis)"`, or the
+    /// reason it was dropped.
+    pub audio: String,
     /// Detected direction reversals, empty unless auto direction was used.
     pub reversals: Vec<DirectionReversal>,
     /// Per-frame motion trace, empty unless auto direction was used.
@@ -607,11 +611,21 @@ fn convert_video(
         ));
     }
 
+    // Carry the source audio into the finished file. The video is complete
+    // at this point, so an audio problem degrades the report instead of
+    // failing the conversion (the remux pass leaves the video untouched on
+    // any error).
+    let audio = match crate::audio::attach_audio(video, Path::new(video_out)) {
+        Ok(desc) => desc,
+        Err(e) => format!("dropped ({e})"),
+    };
+
     Ok(ConversionReport {
         frames: frame_count,
         decoder: decoder_name,
         blender: blender_name,
         encoder: encoder_name,
+        audio,
         reversals,
         motion,
     })
