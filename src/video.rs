@@ -136,8 +136,19 @@ pub struct MotionPoint {
     pub frame: usize,
     /// Source timestamp in seconds.
     pub time: f64,
-    /// Measured horizontal drift in pixels (+ = content moved right).
+    /// Camera-normalised horizontal drift in pixels (+ = camera moved
+    /// right). Taken from the full-frame or centre measurement depending on
+    /// [`Self::regime`].
     pub dx: f32,
+    /// Raw full-frame drift in pixels (+ = content moved right). NaN when
+    /// the frame could not be matched.
+    pub full_dx: f32,
+    /// Raw centre-window drift — where the tracked subject is — in pixels.
+    /// NaN when the region was unreliable.
+    pub center_dx: f32,
+    /// Which surface the frame's drift came from: `background`, `subject`
+    /// (reported negated) or `pending`.
+    pub regime: &'static str,
     /// False when the frame could not be matched (scene cut, textureless).
     pub reliable: bool,
     /// Detected trend after this sample.
@@ -186,6 +197,11 @@ pub enum DirectionChoice {
 /// `Clockwise`. `reverse` inverts the mapping. A missing trend (stationary
 /// camera, or fewer than two frames) falls back to the un-reversed base
 /// pairing.
+///
+/// The estimator reports *camera* motion either way — background drift
+/// directly, subject drift negated (see [`crate::motion`]) — so a tightly
+/// cropped video where the tracked subject dominates the frame maps the same
+/// as a wide one.
 fn trend_to_direction(trend: Option<Trend>, reverse: bool) -> VideoDirection {
     let clockwise_forwards = match trend {
         Some(Trend::Increasing) => false,
@@ -277,6 +293,9 @@ impl Pairer {
                         frame: index,
                         time: time_secs,
                         dx: sample.dx,
+                        full_dx: sample.full_dx,
+                        center_dx: sample.center_dx,
+                        regime: sample.regime.name(),
                         reliable: sample.reliable,
                         trend: tracker.current_trend(),
                     });

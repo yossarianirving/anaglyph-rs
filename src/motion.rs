@@ -5,24 +5,82 @@
 //! the camera travels along the arc. When the booth reverses for a
 //! "boomerang" pass the pairing has to swap, and the reversal can be read off
 //! the images themselves. The camera rotates to keep the subject framed, so
-//! that tracking rotation dominates the image motion and the background
-//! slides in the *same* direction the camera moves: content drifting right
-//! means the camera moved right, i.e. the newer frame is the right-eye view.
+//! that tracking rotation dominates the image motion and the *background*
+//! slides in the same direction the camera moves: background content drifting
+//! right means the camera moved right, i.e. the newer frame is the right-eye
+//! view.
 //!
-//! [`MotionEstimator`] measures that per-frame slide; [`DirectionTracker`]
-//! integrates the slide into a zig-zag trend, reports confirmed reversal
-//! points, and tracks how far a streaming pipeline may emit frames without
-//! guessing. Pure CPU, no dependencies, usable from wasm.
+//! That rule holds for background content only. The tracked subject's front
+//! surface sits *closer* to the lens than the orbit center the camera keeps
+//! framed, so subject texture drifts *opposite* to the camera. A tightly
+//! cropped video, where the subject fills the frame and no background
+//! remains, therefore runs backwards under the background rule and its eye
+//! pairing comes out pseudoscopic.
+//!
+//! [`MotionEstimator`] measures the per-frame slide twice: over the whole
+//! frame and over a window centered on the tracked subject. Background content
+//! slides much faster than subject texture (a background point shifts by
+//! `f * Tx * (1/Zs - 1/Z)` per frame, while the subject's front only
+//! protrudes decimeters toward the lens), so whichever of the two streams
+//! carries the larger *coherent* drift - the absolute sum over a frame window,
+//! so noise averages out - is the one the camera is dragging along. Samples
+//! are reported as a single camera-normalized drift: positive always means the
+//! camera moved right, using the raw full-frame median when that stream wins
+//! and the negated center-window median when the subject stream wins.
+//! [`DirectionTracker`] integrates that drift into a zig-zag trend, reports
+//! confirmed reversal points, and tracks how far a streaming pipeline may emit
+//! frames without guessing. Pure CPU, no dependencies, usable from wasm.
 
-/// Measured horizontal motion of the image content between two frames.
+use std::collections::VecDeque;
+
+/// Measured horizontal motion of the image content between two frames,
+/// normalized to camera motion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotionSample {
-    /// Signed horizontal drift in source pixels per frame, positive when the
-    /// image content moved right (the camera moved left).
+    /// Signed horizontal camera drift in source pixels per frame, positive
+    /// when the camera moved right (the newer frame is the right-eye view).
+    /// Zero while the regime is still [`Regime::Pending`], so downstream
+    /// consumers keep holding frames instead of guessing.
     pub dx: f32,
     /// `false` when the frames could not be matched reliably: scene cut,
     /// motion beyond the search range, or textureless input.
     pub reliable: bool,
+    /// Raw full-frame median content drift in source pixels, positive when
+    /// the image content moved right; `NaN` when that match was unreliable.
+    /// Diagnostic - see also [`MotionSample::dx`].
+    pub full_dx: f32,
+    /// Raw center-window median content drift, same sign convention as
+    /// [`MotionSample::full_dx`]; `NaN` when that match was unreliable.
+    pub center_dx: f32,
+    /// How the measurement was interpreted.
+    pub regime: Regime,
+}
+
+/// How [`MotionEstimator`] interprets the texture dominating the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Regime {
+    /// Not enough measurement history yet; drift reports zero and pipelines
+    /// should keep holding frames.
+    Pending,
+    /// The whole-frame stream carries the stronger coherent drift, so the
+    /// frame still shows background sliding with the camera; the reported
+    /// drift is the raw full-frame median.
+    Background,
+    /// The centre stream carries the stronger coherent drift: the frame is
+    /// dominated by the tracked subject (a tight crop leaves no moving
+    /// background). The reported drift is the negated centre-window median,
+    /// because the subject's front surface slides against the camera.
+    Subject,
+}
+
+impl Regime {
+    pub fn name(self) -> &'static str {
+        match self {
+            Regime::Pending => "pending",
+            Regime::Background => "background",
+            Regime::Subject => "subject",
+        }
+    }
 }
 
 /// Width the frames are shrunk to before block matching; the motion estimate
@@ -41,13 +99,50 @@ const MIN_BLOCK_VARIANCE: f32 = 6.0;
 const CUT_QUALITY_LIMIT: f32 = 0.45;
 /// Fewer than this fraction of the block grid matchable -> unreliable sample.
 const MIN_BLOCK_RATIO: f32 = 0.2;
+/// The centered window matched for the subject stream: the camera keeps the
+/// subject near the image center, so this is where subject texture always is
+/// no matter how tight the crop, and it also skips fixed overlays (the
+/// watermark bars booth videos carry) along the frame edges.
+const CENTER_WINDOW_X: f32 = 0.5;
+const CENTER_WINDOW_Y: f32 = 0.5;
+/// Frames the coherent drift of each stream (its signed sum, so noise
+/// cancels) is compared over: long enough to average out match noise, short
+/// enough to still follow a boomerang reversal.
+const RATE_WINDOW: usize = 36;
+/// How much stronger one stream's coherent drift must be, as a ratio, to be
+/// read as the one the camera is dragging along. Measured on real footage:
+/// wide shots run the whole-frame stream 1.1-1.6x the centre stream, tight
+/// crops run the centre stream 1.4-7x the whole frame.
+const RATE_MARGIN: f32 = 1.1;
+/// A whole-frame coherent drift at or above this, in matched pixels per frame,
+/// is what a tracking booth camera drags across real background (measured
+/// ~3.4). Below it an initial background call is only startup noise, and
+/// committing to it locks a tightly cropped video into the pseudoscopic
+/// reading - so while undecided, only the subject stream may win below this.
+const BACKGROUND_FLOOR: f32 = 1.5;
+/// Frames of sustained disagreement that commit a regime, or flip it.
+const REGIME_CONFIRM: usize = 4;
+/// The share of a window both regions must have matched for it to vote: a
+/// region that fails to match reports nothing, which must not read as zero
+/// drift (the centre of a tight crop often fails in blurry, fast-moving
+/// frames - exactly where a decision must not be made).
+const REGION_VALID_RATIO: f32 = 0.7;
+/// Frames after which an undecided limbo (noise too weak to separate the two
+/// streams) gives up and defaults to the background regime, bounding how long
+/// the pipeline holds frames.
+const PENDING_LIMIT: usize = 80;
 
-/// Estimates the horizontal drift between consecutive frames of a video.
+/// Estimates the camera's horizontal drift between consecutive video frames.
 ///
-/// Frames are box-downsampled to grayscale and matched block-by-block; the
-/// per-block shifts are reduced with a median so a subject moving against the
-/// camera (or a static subject, where those blocks are flat) cannot sway the
-/// result, which is dominated by the background the camera orbits.
+/// Frames are box-downsampled to grayscale and matched block-by-block twice:
+/// over the whole frame and over a [`CENTER_WINDOW_X`] x [`CENTER_WINDOW_Y`]
+/// centered window. The per-block shifts are reduced with a median in each
+/// region so the subject moving against the camera (or, when the subject is
+/// static, flat blocks) cannot sway the result. Which region's median
+/// represents the *camera* depends on the framing: see the [module docs] and
+/// [`Regime`]; the estimator decides between them by comparing each region's
+/// coherent drift over [`RATE_WINDOW`] frames, and reports a
+/// camera-normalized [`MotionSample`].
 pub struct MotionEstimator {
     src_width: usize,
     width: usize,
@@ -56,8 +151,25 @@ pub struct MotionEstimator {
     scale: f32,
     x_ranges: Vec<(u32, u32)>,
     y_ranges: Vec<(u32, u32)>,
+    /// Center-window bounds in matched pixels: ((x lo, x hi), (y lo, y hi)).
+    center_win: ((f32, f32), (f32, f32)),
     prev: Vec<u8>,
     have_prev: bool,
+    /// Recent per-frame drifts of each stream (source px, `NaN` when that
+    /// region failed to match) with their signed sums and match counts, for
+    /// the coherent-magnitude regime decision.
+    full_window: VecDeque<f32>,
+    center_window: VecDeque<f32>,
+    full_sum: f32,
+    center_sum: f32,
+    full_hits: usize,
+    center_hits: usize,
+    /// Frames voting for each regime against the current one.
+    bg_run: usize,
+    subj_run: usize,
+    regime: Regime,
+    /// Frames observed since the first, for the [`PENDING_LIMIT`] fallback.
+    matched: usize,
 }
 
 impl MotionEstimator {
@@ -82,6 +194,11 @@ impl MotionEstimator {
                 })
                 .collect()
         };
+        let win = |small: f32, window: f32| {
+            let window = window.clamp(f32::EPSILON, 1.0);
+            let pad = small * (1.0 - window) / 2.0;
+            (pad, small - pad)
+        };
         MotionEstimator {
             src_width: width,
             width: sw,
@@ -89,8 +206,22 @@ impl MotionEstimator {
             scale,
             x_ranges: ranges(sw, width),
             y_ranges: ranges(sh, height),
+            center_win: (
+                win(sw as f32, CENTER_WINDOW_X),
+                win(sh as f32, CENTER_WINDOW_Y),
+            ),
             prev: Vec::new(),
             have_prev: false,
+            full_window: VecDeque::new(),
+            center_window: VecDeque::new(),
+            full_sum: 0.0,
+            center_sum: 0.0,
+            full_hits: 0,
+            center_hits: 0,
+            bg_run: 0,
+            subj_run: 0,
+            regime: Regime::Pending,
+            matched: 0,
         }
     }
 
@@ -99,17 +230,159 @@ impl MotionEstimator {
     pub fn observe(&mut self, rgb: &[u8]) -> MotionSample {
         let gray = self.downsample(rgb);
         let sample = if self.have_prev {
-            self.match_frames(&gray)
+            let full =
+                self.match_frames(&gray, (0.0, self.width as f32), (0.0, self.height as f32));
+            let center = self.match_frames(&gray, self.center_win.0, self.center_win.1);
+            self.update_regime(full, center);
+            self.normalize(full, center)
         } else {
             // Nothing to compare the first frame against.
             MotionSample {
                 dx: 0.0,
                 reliable: false,
+                full_dx: f32::NAN,
+                center_dx: f32::NAN,
+                regime: self.regime,
             }
         };
         self.prev = gray;
         self.have_prev = true;
         sample
+    }
+
+    /// Compares the streams' coherent drift magnitudes and commits the
+    /// measurement regime once one of them has stayed ahead long enough
+    /// (drifts are in source pixels; the floor is in matched pixels, so the
+    /// decision is resolution-independent).
+    fn update_regime(&mut self, full: Option<f32>, center: Option<f32>) {
+        Self::push(
+            &mut self.full_window,
+            &mut self.full_sum,
+            &mut self.full_hits,
+            full,
+        );
+        Self::push(
+            &mut self.center_window,
+            &mut self.center_sum,
+            &mut self.center_hits,
+            center,
+        );
+        self.matched += 1;
+        let vote = self.stronger_stream();
+        match vote {
+            Some(Regime::Background) => {
+                self.bg_run += 1;
+                self.subj_run = 0;
+            }
+            Some(Regime::Subject) => {
+                self.subj_run += 1;
+                self.bg_run = 0;
+            }
+            _ => {
+                self.bg_run = 0;
+                self.subj_run = 0;
+            }
+        }
+        self.regime = match self.regime {
+            Regime::Pending => {
+                if self.bg_run >= REGIME_CONFIRM {
+                    Regime::Background
+                } else if self.subj_run >= REGIME_CONFIRM {
+                    Regime::Subject
+                } else if self.matched >= PENDING_LIMIT {
+                    // Undecidable (a barely moving camera, perhaps): the
+                    // background rule is the historical default and misreads
+                    // less while little parallax is in play anyway.
+                    Regime::Background
+                } else {
+                    Regime::Pending
+                }
+            }
+            Regime::Background if self.subj_run >= REGIME_CONFIRM => Regime::Subject,
+            Regime::Subject if self.bg_run >= REGIME_CONFIRM => Regime::Background,
+            other => other,
+        };
+        // Runs measure sustained disagreement with the current choice, so
+        // agreement (or a fresh commit) clears them.
+        if vote == Some(self.regime) {
+            self.bg_run = 0;
+            self.subj_run = 0;
+        }
+    }
+
+    /// Adds one frame's drift to a sliding window, keeping its signed sum and
+    /// match count current; `NaN` marks a frame whose region failed to match.
+    fn push(window: &mut VecDeque<f32>, sum: &mut f32, hits: &mut usize, drift: Option<f32>) {
+        let value = drift.unwrap_or(f32::NAN);
+        if value.is_finite() {
+            *sum += value;
+            *hits += 1;
+        }
+        window.push_back(value);
+        if window.len() > RATE_WINDOW {
+            if let Some(old) = window.pop_front() {
+                if old.is_finite() {
+                    *sum -= old;
+                    *hits -= 1;
+                }
+            }
+        }
+    }
+
+    /// Which stream carries the camera over the current window. The stronger
+    /// coherent drift wins: background texture slides far faster than the
+    /// tracked subject's own surface, so a whole-frame stream ahead of the
+    /// centre's means the frame still shows background, and a centre stream
+    /// ahead means the subject fills the frame. No vote at all while the
+    /// window is incomplete or a region barely matched, and while undecided
+    /// the background call additionally needs [`BACKGROUND_FLOOR`] to rule out
+    /// startup noise.
+    fn stronger_stream(&self) -> Option<Regime> {
+        let min_hits = (RATE_WINDOW as f32 * REGION_VALID_RATIO) as usize;
+        if self.full_window.len() < RATE_WINDOW
+            || self.full_hits < min_hits
+            || self.center_hits < min_hits
+        {
+            return None;
+        }
+        let full = self.full_sum.abs() * self.scale / RATE_WINDOW as f32;
+        let center = self.center_sum.abs() * self.scale / RATE_WINDOW as f32;
+        if center >= full * RATE_MARGIN {
+            Some(Regime::Subject)
+        } else if full >= center * RATE_MARGIN
+            && (self.regime != Regime::Pending || full >= BACKGROUND_FLOOR)
+        {
+            Some(Regime::Background)
+        } else {
+            None
+        }
+    }
+
+    /// Reduce the two raw region medians to one camera-normalized sample.
+    fn normalize(&self, full: Option<f32>, center: Option<f32>) -> MotionSample {
+        let (dx, reliable) = match self.regime {
+            // Hold: report zero drift so the tracker stays undecided and the
+            // pipeline keeps buffering instead of pairing on a guess.
+            Regime::Pending => (0.0, full.is_some() || center.is_some()),
+            Regime::Background => match full {
+                Some(dx) => (dx, true),
+                None => (0.0, false),
+            },
+            // Subject texture slides against the camera: negate. If the
+            // center failed to match, fall back to the whole frame, which in
+            // this regime is subject-dominated too.
+            Regime::Subject => match center.or(full) {
+                Some(dx) => (-dx, true),
+                None => (0.0, false),
+            },
+        };
+        MotionSample {
+            dx,
+            reliable,
+            full_dx: full.unwrap_or(f32::NAN),
+            center_dx: center.unwrap_or(f32::NAN),
+            regime: self.regime,
+        }
     }
 
     /// Box-downsample RGB24 to the matched-size grayscale buffer.
@@ -138,48 +411,53 @@ impl MotionEstimator {
         out
     }
 
-    /// Median block shift between the stored previous frame and `cur`.
-    fn match_frames(&self, cur: &[u8]) -> MotionSample {
-        let unreliable = || MotionSample {
-            dx: 0.0,
-            reliable: false,
-        };
+    /// Median block shift between the stored previous frame and `cur`, over
+    /// the blocks whose center lies inside `(wx, wy)` (matched pixels), as
+    /// drift in source pixels, or `None` when too few blocks matched or the
+    /// match quality says the frames show unrelated content.
+    fn match_frames(&self, cur: &[u8], wx: (f32, f32), wy: (f32, f32)) -> Option<f32> {
         // Blocks need `MAX_SHIFT` of margin on both sides to search in.
         if self.width < 2 * MAX_SHIFT + BLOCK || self.height < BLOCK {
-            return unreliable();
+            return None;
         }
         let mut shifts: Vec<f32> = Vec::new();
         let mut grid = 0usize;
         let mut sad_sum = 0.0f32;
         let mut dev_sum = 0.0f32;
+        let in_win = |lo: f32, hi: f32, c: usize| {
+            let c = c as f32 + BLOCK as f32 / 2.0;
+            lo <= c && c < hi
+        };
         for by in (0..=self.height - BLOCK).step_by(BLOCK) {
+            if !in_win(wy.0, wy.1, by) {
+                continue;
+            }
             let mut bx = MAX_SHIFT;
             while bx + BLOCK + MAX_SHIFT <= self.width {
-                grid += 1;
-                if let Some((shift, sad, dev)) = self.match_block(by, bx, cur) {
-                    shifts.push(shift);
-                    sad_sum += sad;
-                    dev_sum += dev;
+                if in_win(wx.0, wx.1, bx) {
+                    grid += 1;
+                    if let Some((shift, sad, dev)) = self.match_block(by, bx, cur) {
+                        shifts.push(shift);
+                        sad_sum += sad;
+                        dev_sum += dev;
+                    }
                 }
                 bx += BLOCK;
             }
         }
         let qualified = shifts.len();
         if qualified == 0 || (qualified as f32) < grid as f32 * MIN_BLOCK_RATIO {
-            return unreliable();
+            return None;
         }
         // Mean best-match error relative to the mean block deviation: near 0
         // for a solid match, far above the cut limit when the frames show
         // unrelated content.
         let quality = (sad_sum / qualified as f32) / (dev_sum / qualified as f32 + 1.0);
         if quality > CUT_QUALITY_LIMIT {
-            return unreliable();
+            return None;
         }
         shifts.sort_unstable_by(f32::total_cmp);
-        MotionSample {
-            dx: shifts[qualified / 2] / self.scale,
-            reliable: true,
-        }
+        Some(shifts[qualified / 2] / self.scale)
     }
 
     /// Best horizontal shift for one block as `(subpixel shift in matched
@@ -258,12 +536,12 @@ impl MotionEstimator {
     }
 }
 
-/// Direction of the integrated image drift over the current segment.
+/// Direction of the integrated camera drift over the current segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trend {
-    /// Image content drifting right (camera moving left).
+    /// Camera drifting right (the newer frame is the right-eye view).
     Increasing,
-    /// Image content drifting left (camera moving right).
+    /// Camera drifting left (the newer frame is the left-eye view).
     Decreasing,
 }
 
@@ -473,7 +751,13 @@ mod tests {
     use super::*;
 
     fn sample(dx: f32) -> MotionSample {
-        MotionSample { dx, reliable: true }
+        MotionSample {
+            dx,
+            reliable: true,
+            full_dx: dx,
+            center_dx: dx,
+            regime: Regime::Background,
+        }
     }
 
     fn feed(tracker: &mut DirectionTracker, start: usize, dxs: &[f32]) {
@@ -558,6 +842,9 @@ mod tests {
             &MotionSample {
                 dx: 0.0,
                 reliable: false,
+                full_dx: f32::NAN,
+                center_dx: f32::NAN,
+                regime: Regime::Background,
             },
         );
         assert_eq!(t.confirmed_through(), Some(20));
@@ -672,7 +959,12 @@ mod tests {
         est.observe(&prev);
         let s = est.observe(&cur);
         assert!(s.reliable, "textured pair should match");
-        assert!((s.dx - 5.0).abs() <= 1.0, "dx = {}", s.dx);
+        assert!((s.full_dx - 5.0).abs() <= 1.0, "full_dx = {}", s.full_dx);
+        assert!(
+            (s.center_dx - 5.0).abs() <= 1.0,
+            "center_dx = {}",
+            s.center_dx
+        );
     }
 
     #[test]
@@ -687,7 +979,7 @@ mod tests {
         est.observe(&prev);
         let s = est.observe(&cur);
         assert!(s.reliable);
-        assert!((s.dx + 10.0).abs() <= 3.0, "dx = {}", s.dx);
+        assert!((s.full_dx + 10.0).abs() <= 3.0, "full_dx = {}", s.full_dx);
     }
 
     #[test]
@@ -711,7 +1003,7 @@ mod tests {
         // Background slides 4 px right while the "subject" slides 40 px left.
         let s = est.observe(&frame(2, 20));
         assert!(s.reliable);
-        assert!((s.dx - 4.0).abs() <= 1.5, "dx = {}", s.dx);
+        assert!((s.full_dx - 4.0).abs() <= 1.5, "full_dx = {}", s.full_dx);
     }
 
     #[test]
@@ -732,5 +1024,122 @@ mod tests {
         let mut est = MotionEstimator::new(w, h);
         est.observe(&flat);
         assert!(!est.observe(&flat).reliable);
+    }
+
+    /// Left (and right) margin a test master has beyond the frame it feeds,
+    /// so a band can slide within it without sampling past its edge.
+    const BAND_MARGIN: usize = 200;
+
+    /// A `mw x mh` frame cut from `m` (which must be `mw + BAND_MARGIN`
+    /// wide): outside `inner` (x0..x1, y0..y1) the content stays pinned,
+    /// inside it shows the master shifted `off` pixels right.
+    fn shifted_band_rgb(
+        m: &[u8],
+        mw: usize,
+        mh: usize,
+        inner: (usize, usize, usize, usize),
+        off: usize,
+    ) -> Vec<u8> {
+        let stride = mw + BAND_MARGIN;
+        let mut rgb = Vec::with_capacity(mw * mh * 3);
+        for y in 0..mh {
+            for x in 0..mw {
+                let inside = inner.0 <= x && x < inner.1 && inner.2 <= y && y < inner.3;
+                let shift = if inside { off } else { 0 };
+                let g = m[y * stride + x + BAND_MARGIN - shift];
+                rgb.extend_from_slice(&[g, g, g]);
+            }
+        }
+        rgb
+    }
+
+    /// A `mw x mh` frame from a master `m` (`mw + BAND_MARGIN` wide): the
+    /// whole frame slides `off_bg` px right while the blob inside `inner`
+    /// (x0..x1, y0..y1) crawls at `off_sub` px - the fast background stream of
+    /// a tracking camera past a subject that barely moves.
+    fn layered_rgb(
+        m: &[u8],
+        mw: usize,
+        mh: usize,
+        inner: (usize, usize, usize, usize),
+        off_bg: usize,
+        off_sub: usize,
+    ) -> Vec<u8> {
+        let stride = mw + BAND_MARGIN;
+        let mut rgb = Vec::with_capacity(mw * mh * 3);
+        for y in 0..mh {
+            for x in 0..mw {
+                let inside = inner.0 <= x && x < inner.1 && inner.2 <= y && y < inner.3;
+                let off = if inside { off_sub } else { off_bg };
+                let g = m[y * stride + x + BAND_MARGIN - off];
+                rgb.extend_from_slice(&[g, g, g]);
+            }
+        }
+        rgb
+    }
+
+    #[test]
+    fn wide_shot_reads_the_background_stream() {
+        // Background slides 4 px per frame while the subject in the middle
+        // drifts against it: the fast whole-frame stream is the camera's, and
+        // its raw median is reported unchanged.
+        let (w, h) = (512, 160);
+        let stride = w + 2 * BAND_MARGIN;
+        let m = blur(&master(stride, h, 23), stride, h, 3);
+        let blob = (w / 4 - 16, 3 * w / 4 + 16, h / 4 - 8, 3 * h / 4 + 8);
+        let mut est = MotionEstimator::new(w, h);
+        est.observe(&layered_rgb(&m, w, h, blob, 0, 0));
+        let mut s = est.observe(&layered_rgb(&m, w, h, blob, 0, 0));
+        for i in 0..44 {
+            s = est.observe(&layered_rgb(&m, w, h, blob, 4 * (i + 1), i.div_ceil(2)));
+        }
+        assert_eq!(s.regime, Regime::Background);
+        assert!((s.dx - 4.0).abs() <= 1.0, "dx = {}", s.dx);
+        assert_eq!(
+            s.dx, s.full_dx,
+            "the background regime reports the raw median"
+        );
+        assert!(
+            s.center_dx.abs() < s.full_dx.abs(),
+            "the subject must drag the centre stream down: center_dx = {}, full_dx = {}",
+            s.center_dx,
+            s.full_dx
+        );
+    }
+
+    #[test]
+    fn subject_only_drift_is_flipped() {
+        // Only the centre window slides (the tracked subject's surface); the
+        // pinned frame edges hold the whole-frame median near zero, so the
+        // centre stream wins the comparison, the regime goes Subject, and the
+        // negated centre measurement becomes the reported camera drift.
+        let (w, h) = (512, 160);
+        let m = blur(
+            &master(w + 2 * BAND_MARGIN, h, 31),
+            w + 2 * BAND_MARGIN,
+            h,
+            3,
+        );
+        // Exactly the estimator's centre window in source pixels (it matches
+        // at half this width).
+        let inner = (w / 4, 3 * w / 4, h / 4, 3 * h / 4);
+        let mut est = MotionEstimator::new(w, h);
+        est.observe(&shifted_band_rgb(&m, w, h, inner, 0));
+        let first = est.observe(&shifted_band_rgb(&m, w, h, inner, 3));
+        assert!(first.reliable);
+        assert_eq!(first.regime, Regime::Pending, "one frame cannot decide");
+        assert_eq!(first.dx, 0.0, "pending samples hold at zero");
+        assert!((first.full_dx).abs() <= 0.5, "full_dx = {}", first.full_dx);
+        assert!(
+            (first.center_dx - 3.0).abs() <= 1.0,
+            "center_dx = {}",
+            first.center_dx
+        );
+        let mut s = first;
+        for i in 0..60 {
+            s = est.observe(&shifted_band_rgb(&m, w, h, inner, 3 * (i + 2)));
+        }
+        assert_eq!(s.regime, Regime::Subject);
+        assert!((s.dx + 3.0).abs() <= 1.0, "dx = {}", s.dx);
     }
 }

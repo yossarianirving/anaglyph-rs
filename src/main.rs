@@ -269,8 +269,16 @@ fn write_motion_json(path: &str, report: &video::ConversionReport) -> Result<(),
                 None => "null",
             };
             format!(
-                "    {{ \"frame\": {}, \"time\": {:.3}, \"dx\": {:.4}, \"reliable\": {}, \"trend\": {} }}",
-                p.frame, p.time, p.dx, p.reliable, trend
+                "    {{ \"frame\": {}, \"time\": {:.3}, \"dx\": {}, \"full_dx\": {}, \
+                 \"center_dx\": {}, \"regime\": \"{}\", \"reliable\": {}, \"trend\": {} }}",
+                p.frame,
+                p.time,
+                json_num(p.dx),
+                json_num(p.full_dx),
+                json_num(p.center_dx),
+                p.regime,
+                p.reliable,
+                trend
             )
         })
         .collect();
@@ -289,5 +297,15 @@ fn json_array(entries: &[String]) -> String {
         "[]".to_string()
     } else {
         format!("[\n{}\n  ]", entries.join(",\n"))
+    }
+}
+
+/// A JSON number, or `null` when the measurement is NaN (unmatched frame).
+#[cfg(feature = "video")]
+fn json_num(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v:.4}")
+    } else {
+        "null".to_string()
     }
 }

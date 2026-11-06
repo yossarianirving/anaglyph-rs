@@ -86,10 +86,13 @@ cargo run --features video --release -- --video booth.mp4 --out hs.mp4 -d auto
 
 Each detected reversal is printed (`reversal at 12.01s (frame 361): clockwise
 -> counter-clockwise`) and the output stays correct across scene cuts and when
-the subject moves against the camera. If the result looks *pseudoscopic* (the
-depth is inverted) your rig's rotation runs opposite to the assumed
-convention: `-d auto-reverse` flips the detected pairing. Auto mode adds about
-0.5 ms per frame of analysis, which is hidden inside the decode step.
+the subject moves against the camera. Framing does not matter either: a wide
+shot is read from the background sliding past, a tight crop where the subject
+fills the frame from its own surface parallax, which runs the other way. If the
+result looks *pseudoscopic* (the depth is inverted) your rig's rotation runs
+opposite to the assumed convention: `-d auto-reverse` flips the detected
+pairing. Auto mode adds about 0.7 ms per frame of analysis at 720p, which is
+hidden inside the decode step.
 
 The blend backend is chosen with `-b/--blend auto|gpu|cpu` (applies to video
 and gif; images always blend on the CPU). `auto`, the default, prefers the
@@ -114,8 +117,12 @@ prints what happened, e.g. `audio:   opus (stream copy)`,
 with the reason when the audio could not be attached.
 
 To debug or tune detection, `--motion-json timeline.json` (with `-d auto`)
-writes the per-frame motion trace — measured drift, whether the frame matched
-reliably, the detected trend, and the reversal points — as JSON.
+writes the per-frame motion trace as JSON: the camera-normalised drift (`dx`),
+the raw whole-frame and centre-window medians it was chosen from (`full_dx`,
+`center_dx`), which of the two the frame was read with (`regime`), whether the
+frame matched reliably, the detected trend, and the reversal points. The
+`motion_probe` example runs the same measurement over a file without blending
+(`cargo run --release --features video --example motion_probe -- in.mp4 trace.tsv`).
 
 ## Web (wasm + WebGPU)
 

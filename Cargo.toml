@@ -19,6 +19,10 @@ required-features = ["gpu"]
 name = "bench_stages"
 required-features = ["video"]
 
+[[example]]
+name = "motion_probe"
+required-features = ["video"]
+
 [dependencies]
 clap = { version = "4.5.4", features = ["derive", "cargo"] }
 image = { version = "0.25.5", features = ["gif"] }
