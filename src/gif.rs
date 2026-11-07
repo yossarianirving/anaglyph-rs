@@ -146,10 +146,10 @@ pub async fn convert_gif_buffer_to_anaglyph_async(
             web_sys::console::log_1(&"anaglyph: blending frames on WebGPU".into());
             Some(blender)
         }
-        Err(e) => {
+        Err(_e) => {
             #[cfg(feature = "wasm")]
             web_sys::console::warn_1(
-                &format!("anaglyph: WebGPU unavailable ({e}), using CPU blending").into(),
+                &format!("anaglyph: WebGPU unavailable ({_e}), using CPU blending").into(),
             );
             None
         }
