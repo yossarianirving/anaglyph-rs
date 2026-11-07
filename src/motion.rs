@@ -14,6 +14,8 @@
 //! points, and tracks how far a streaming pipeline may emit frames without
 //! guessing. Pure CPU, no dependencies, usable from wasm.
 
+use crate::anaglyph::VideoDirection;
+
 /// Measured horizontal motion of the image content between two frames.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotionSample {
@@ -265,6 +267,31 @@ pub enum Trend {
     Increasing,
     /// Image content drifting left (camera moving right).
     Decreasing,
+}
+
+/// Map a detected drift trend onto an eye pairing.
+///
+/// Convention: the booth camera rotates to keep the subject framed, and that
+/// tracking rotation dominates the image motion — a background point shifts
+/// by `f * Tx * (1/Zs - 1/Z)` per frame, so content drifts in the *same*
+/// direction as the camera's translation (verified on real booth footage:
+/// the background slides, the tracked subject stays nearly put). Image
+/// content drifting right therefore means the camera moved right, the newer
+/// frame is the physically *right* view, and the older frame feeds the left
+/// eye (`VideoDirection::CounterClockwise`); content drifting left gives
+/// `Clockwise`. `reverse` inverts the mapping. A missing trend (stationary
+/// camera, or fewer than two frames) falls back to the un-reversed base
+/// pairing.
+pub fn trend_to_direction(trend: Option<Trend>, reverse: bool) -> VideoDirection {
+    let clockwise_forwards = match trend {
+        Some(Trend::Increasing) => false,
+        Some(Trend::Decreasing) | None => true,
+    };
+    if clockwise_forwards != reverse {
+        VideoDirection::Clockwise
+    } else {
+        VideoDirection::CounterClockwise
+    }
 }
 
 /// A confirmed reversal of the drift trend.

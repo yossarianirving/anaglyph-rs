@@ -16,7 +16,7 @@ use crate::anaglyph::{
 };
 use crate::gpu::GpuBlender;
 use crate::hwencode::{self, EncodeOptions, HwCodec, HwEncoder};
-use crate::motion::{DirectionTracker, MotionEstimator, MotionSample, Trend};
+use crate::motion::{trend_to_direction, DirectionTracker, MotionEstimator, MotionSample, Trend};
 
 /// Device types to try for hardware-accelerated decoding, in order.
 const HWACCEL_PREFERENCE: [HardwareAccelerationDeviceType; 3] = [
@@ -171,31 +171,6 @@ pub enum DirectionChoice {
     /// eyes at every reversal. `reverse` flips the detected pairing, for rigs
     /// whose physical rotation runs opposite to the convention below.
     Auto { reverse: bool },
-}
-
-/// Map a detected drift trend onto an eye pairing.
-///
-/// Convention: the booth camera rotates to keep the subject framed, and that
-/// tracking rotation dominates the image motion — a background point shifts
-/// by `f * Tx * (1/Zs - 1/Z)` per frame, so content drifts in the *same*
-/// direction as the camera's translation (verified on real booth footage:
-/// the background slides, the tracked subject stays nearly put). Image
-/// content drifting right therefore means the camera moved right, the newer
-/// frame is the physically *right* view, and the older frame feeds the left
-/// eye (`VideoDirection::CounterClockwise`); content drifting left gives
-/// `Clockwise`. `reverse` inverts the mapping. A missing trend (stationary
-/// camera, or fewer than two frames) falls back to the un-reversed base
-/// pairing.
-fn trend_to_direction(trend: Option<Trend>, reverse: bool) -> VideoDirection {
-    let clockwise_forwards = match trend {
-        Some(Trend::Increasing) => false,
-        Some(Trend::Decreasing) | None => true,
-    };
-    if clockwise_forwards != reverse {
-        VideoDirection::Clockwise
-    } else {
-        VideoDirection::CounterClockwise
-    }
 }
 
 /// A decoded frame waiting to be paired.
