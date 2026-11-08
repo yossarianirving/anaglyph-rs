@@ -59,6 +59,9 @@ pub struct MotionEstimator {
     x_ranges: Vec<(u32, u32)>,
     y_ranges: Vec<(u32, u32)>,
     prev: Vec<u8>,
+    /// Scratch for the current frame's grayscale; swapped with `prev` after
+    /// matching so steady-state observation allocates nothing.
+    cur: Vec<u8>,
     have_prev: bool,
 }
 
@@ -92,6 +95,7 @@ impl MotionEstimator {
             x_ranges: ranges(sw, width),
             y_ranges: ranges(sh, height),
             prev: Vec::new(),
+            cur: Vec::new(),
             have_prev: false,
         }
     }
@@ -99,9 +103,31 @@ impl MotionEstimator {
     /// Match the next frame (`rgb`, dense RGB24 of the configured size)
     /// against its predecessor and advance the internal state.
     pub fn observe(&mut self, rgb: &[u8]) -> MotionSample {
-        let gray = self.downsample(rgb);
+        let mut cur = std::mem::take(&mut self.cur);
+        cur.resize(self.width * self.height, 0);
+        self.downsample(&mut cur, rgb);
+        self.advance(cur)
+    }
+
+    /// Match the next frame (dense RGBA of the configured size) against its
+    /// predecessor and advance the internal state. The box-downsample reads
+    /// the same R/G/B values through the same BT.601 weights as the RGB24
+    /// [`Self::observe`], so both entry points produce identical samples;
+    /// accepting RGBA directly skips a whole packing pass on the caller
+    /// side (the web pipeline blends and copies RGBA throughout).
+    pub fn observe_rgba(&mut self, rgba: &[u8]) -> MotionSample {
+        let mut cur = std::mem::take(&mut self.cur);
+        cur.resize(self.width * self.height, 0);
+        self.downsample_rgba(&mut cur, rgba);
+        self.advance(cur)
+    }
+
+    /// Reduce the freshly downsampled `cur` against the stored predecessor,
+    /// then make `cur` the new predecessor (the old one becomes next
+    /// frame's scratch).
+    fn advance(&mut self, cur: Vec<u8>) -> MotionSample {
         let sample = if self.have_prev {
-            self.match_frames(&gray)
+            self.match_frames(&cur)
         } else {
             // Nothing to compare the first frame against.
             MotionSample {
@@ -109,14 +135,14 @@ impl MotionEstimator {
                 reliable: false,
             }
         };
-        self.prev = gray;
+        self.cur = std::mem::replace(&mut self.prev, cur);
         self.have_prev = true;
         sample
     }
 
-    /// Box-downsample RGB24 to the matched-size grayscale buffer.
-    fn downsample(&self, rgb: &[u8]) -> Vec<u8> {
-        let mut out = vec![0u8; self.width * self.height];
+    /// Box-downsample RGB24 to the matched-size grayscale buffer (`out`
+    /// holds `width * height` pixels).
+    fn downsample(&self, out: &mut [u8], rgb: &[u8]) {
         for (oy, &(y0, y1)) in self.y_ranges.iter().enumerate() {
             for (ox, &(x0, x1)) in self.x_ranges.iter().enumerate() {
                 let mut sum = 0u32;
@@ -137,7 +163,32 @@ impl MotionEstimator {
                 out[oy * self.width + ox] = (sum / n.max(1)) as u8;
             }
         }
-        out
+    }
+
+    /// Box-downsample RGBA to the matched-size grayscale buffer. Identical
+    /// pixel ranges and luma weights as [`Self::downsample`]; alpha is
+    /// ignored (decoder output is opaque).
+    fn downsample_rgba(&self, out: &mut [u8], rgba: &[u8]) {
+        for (oy, &(y0, y1)) in self.y_ranges.iter().enumerate() {
+            for (ox, &(x0, x1)) in self.x_ranges.iter().enumerate() {
+                let mut sum = 0u32;
+                let mut n = 0u32;
+                for y in y0..y1 {
+                    let row = y as usize * self.src_width;
+                    let start = (row + x0 as usize) * 4;
+                    let end = (row + x1 as usize) * 4;
+                    for px in rgba[start..end].chunks_exact(4) {
+                        // BT.601 luma with integer weights summing to 256.
+                        sum += (77 * u32::from(px[0])
+                            + 150 * u32::from(px[1])
+                            + 29 * u32::from(px[2]))
+                            >> 8;
+                        n += 1;
+                    }
+                }
+                out[oy * self.width + ox] = (sum / n.max(1)) as u8;
+            }
+        }
     }
 
     /// Median block shift between the stored previous frame and `cur`.
@@ -700,6 +751,29 @@ mod tests {
         let s = est.observe(&cur);
         assert!(s.reliable, "textured pair should match");
         assert!((s.dx - 5.0).abs() <= 1.0, "dx = {}", s.dx);
+    }
+
+    #[test]
+    fn observe_rgba_matches_observe_bit_for_bit() {
+        // The RGBA fast path (web pipeline) must produce exactly the same
+        // samples as the RGB24 path for the same R/G/B values, whatever the
+        // alpha lane holds.
+        let (w, h) = (200, 120);
+        let m = master(w + 20, h, 7);
+        let mut rgb_est = MotionEstimator::new(w, h);
+        let mut rgba_est = MotionEstimator::new(w, h);
+        for step in 0..6usize {
+            let rgb = crop_rgb(&m, w + 20, step * 3, w, h);
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for (i, px) in rgb.chunks_exact(3).enumerate() {
+                // Reordered channels + garbage alpha: identical per-pixel
+                // R/G/B, so both paths must agree bit for bit.
+                rgba.extend_from_slice(&[px[2], px[0], px[1], (i * 37) as u8]);
+            }
+            let a = rgb_est.observe(&rgb);
+            let b = rgba_est.observe_rgba(&rgba);
+            assert_eq!(a, b, "step {step}");
+        }
     }
 
     #[test]
