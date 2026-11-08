@@ -1,6 +1,7 @@
 pub mod anaglyph;
 pub mod gif;
 pub mod motion;
+pub mod yuv;
 
 #[cfg(feature = "video")]
 pub mod audio;
