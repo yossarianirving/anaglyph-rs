@@ -113,15 +113,18 @@ pub fn convert_gif_buffer_to_anaglyph(
     encode_anaglyph(new_frames)
 }
 
-/// Async variant of [`convert_gif_buffer_to_anaglyph`] for wasm: blends
-/// frames on WebGPU without blocking the event loop when the `gpu` feature
-/// is enabled, and stays on the CPU otherwise. Errors are returned as
-/// strings since a wasm panic would silently kill a worker.
+/// Async variant of [`convert_gif_buffer_to_anaglyph`] for wasm. `blend`
+/// selects the backend: [`BlenderChoice::Cpu`] never touches the GPU,
+/// [`BlenderChoice::Gpu`] requires WebGPU (an error when the browser does
+/// not provide it), and [`BlenderChoice::Auto`] prefers WebGPU and falls
+/// back to the CPU. Blending never blocks the event loop. Errors are
+/// returned as strings since a wasm panic would silently kill a worker.
 #[cfg(target_arch = "wasm32")]
 pub async fn convert_gif_buffer_to_anaglyph_async(
     gif_data: &[u8],
     direction: VideoDirection,
     anaglyph_type: AnaglyphType,
+    blend: BlenderChoice,
 ) -> Result<Vec<u8>, String> {
     let cursor_in = Cursor::new(gif_data);
     let decoder = GifDecoder::new(cursor_in).map_err(|e| format!("failed to decode gif: {e}"))?;
@@ -137,23 +140,44 @@ pub async fn convert_gif_buffer_to_anaglyph_async(
         .into_buffer();
     let mut previous_frame = first_frame;
 
-    // Fall back to CPU blending when WebGPU is unavailable; report the
+    // Backend selection mirrors the native path: `Cpu` never creates a
+    // blender, `Gpu` fails rather than silently downgrading, and `Auto`
+    // falls back to CPU blending when WebGPU is unavailable, reporting the
     // reason on the JS console so the fallback is visible during debugging.
     #[cfg(feature = "gpu")]
-    let mut gpu = match GpuBlender::new_async(gif_size.0, gif_size.1, anaglyph_matrix).await {
-        Ok(blender) => {
-            #[cfg(feature = "wasm")]
-            web_sys::console::log_1(&"anaglyph: blending frames on WebGPU".into());
-            Some(blender)
-        }
-        Err(_e) => {
-            #[cfg(feature = "wasm")]
-            web_sys::console::warn_1(
-                &format!("anaglyph: WebGPU unavailable ({_e}), using CPU blending").into(),
-            );
-            None
+    let mut gpu = match blend {
+        BlenderChoice::Cpu => None,
+        BlenderChoice::Gpu => Some(
+            GpuBlender::new_async(gif_size.0, gif_size.1, anaglyph_matrix)
+                .await
+                .map_err(|e| format!("WebGPU blending requested but unavailable: {e}"))?,
+        ),
+        BlenderChoice::Auto => {
+            match GpuBlender::new_async(gif_size.0, gif_size.1, anaglyph_matrix).await {
+                Ok(blender) => {
+                    #[cfg(feature = "wasm")]
+                    web_sys::console::log_1(&"anaglyph: blending frames on WebGPU".into());
+                    Some(blender)
+                }
+                Err(_e) => {
+                    #[cfg(feature = "wasm")]
+                    web_sys::console::warn_1(
+                        &format!("anaglyph: WebGPU unavailable ({_e}), using CPU blending").into(),
+                    );
+                    None
+                }
+            }
         }
     };
+    // Without a compiled GPU path there is nothing to select; only `Gpu`
+    // (an explicit request) is a mistake worth reporting.
+    #[cfg(not(feature = "gpu"))]
+    if blend == BlenderChoice::Gpu {
+        return Err(
+            "WebGPU blending requested but this build has no GPU support (build with `--features gpu`)"
+                .into(),
+        );
+    }
 
     let mut new_frames = Vec::<Frame>::new();
     for frame in frames {

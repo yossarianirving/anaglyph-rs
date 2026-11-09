@@ -7,8 +7,8 @@
 <body>
   <h1>Anaglyph GIF converter</h1>
   <p>
-    Frames are blended by a wgpu compute shader (browser WebGPU) compiled to
-    wasm; without WebGPU the same code falls back to a CPU loop.
+    Frames are blended on the CPU by default; choosing WebGPU runs the same
+    blend as a wgpu compute shader compiled to wasm.
   </p>
   <p id="gpu">checking WebGPU…</p>
   <input type="file" id="file" accept="image/gif" />
@@ -18,6 +18,10 @@
     <option>grayscale</option>
     <option>optimized</option>
     <option>true</option>
+  </select>
+  <select id="blend" title="blend backend">
+    <option value="cpu" selected>cpu</option>
+    <option value="gpu">webgpu</option>
   </select>
   <button id="go">convert</button>
   <pre id="status" data-state="idle"></pre>
@@ -29,18 +33,32 @@
   <script type="module">
     import init, { convert_gif_to_anaglyph } from "/pkg/anaglyph_rs.js";
     await init();
-    document.getElementById("gpu").textContent =
-      "gpu" in navigator ? "WebGPU: available" : "WebGPU: NOT available (CPU fallback)";
+    // `navigator.gpu` existing does not mean an adapter exists (headless or
+    // blocked GPUs), so ask WebGPU itself before offering the choice.
+    const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+    document.getElementById("gpu").textContent = adapter
+      ? "WebGPU: available"
+      : "WebGPU: NOT available (CPU only)";
+    if (!adapter) {
+      // Without WebGPU the gpu choice can only fail, so grey it out.
+      document.querySelector("#blend option[value='gpu']").disabled = true;
+    }
 
     const status = document.getElementById("status");
     async function convert(bytes, name) {
       status.dataset.state = "running";
       status.textContent = "converting…";
       const t0 = performance.now();
+      const blend = document.getElementById("blend").value;
       try {
-        const out = await convert_gif_to_anaglyph(bytes, "clockwise", document.getElementById("type").value);
+        const out = await convert_gif_to_anaglyph(
+          bytes,
+          "clockwise",
+          document.getElementById("type").value,
+          blend,
+        );
         const ms = Math.round(performance.now() - t0);
-        status.textContent = `ok ${name}: ${ms} ms, ${(out.length / 1048576).toFixed(2)} MiB out`;
+        status.textContent = `ok ${name} (${blend}): ${ms} ms, ${(out.length / 1048576).toFixed(2)} MiB out`;
         status.dataset.state = "done";
         return out;
       } catch (e) {

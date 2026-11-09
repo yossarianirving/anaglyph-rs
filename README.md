@@ -120,9 +120,9 @@ reliably, the detected trend, and the reversal points — as JSON.
 ## Web (wasm + WebGPU)
 
 The gif converter also runs in the browser: the same `wgpu` compute shader
-blends frames through WebGPU, compiled to wasm with `wasm-bindgen`. Without
-WebGPU the code falls back to a single-threaded CPU loop (a warning is logged
-to the JS console).
+blends frames through WebGPU, compiled to wasm with `wasm-bindgen`. Blending
+defaults to a single-threaded CPU loop; WebGPU is opt-in per call (see the
+`blend` argument below).
 
 Build the package (a `wasm-bindgen-cli` version matching the `wasm-bindgen`
 crate is required; `wasm-pack` 0.15 currently passes flags that recent cargo
@@ -137,14 +137,16 @@ wasm-bindgen target/wasm32-unknown-unknown/release/anaglyph_rs.wasm --out-dir pk
 Then serve the repository root over `http://localhost` (WebGPU requires a
 secure context; `localhost` counts) and open `web/index.html`. It auto-converts
 `web/3drot.gif` (copy any gif there, e.g. `cp test/3drot.gif web/`) and also
-has a file picker.
+has a file picker plus a cpu/webgpu blend selector.
 
 From JavaScript, the exported async function takes the gif bytes and option
-names and resolves with the converted gif bytes:
+names and resolves with the converted gif bytes. The optional `blend` argument
+is `"cpu"` (default), `"gpu"` (fails if the browser has no WebGPU) or `"auto"`
+(WebGPU where available, CPU otherwise):
 
 ```js
 import init, { convert_gif_to_anaglyph } from "./pkg/anaglyph_rs.js";
 await init();
 const bytes = new Uint8Array(await (await fetch("input.gif")).arrayBuffer());
-const out = await convert_gif_to_anaglyph(bytes, "clockwise", "color");
+const out = await convert_gif_to_anaglyph(bytes, "clockwise", "color", "cpu");
 ```
