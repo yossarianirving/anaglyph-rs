@@ -209,9 +209,11 @@ fn combine_rgba(left: &[u8], right: &[u8], anaglyph_matrix: &[[f32; 9]; 2]) -> V
         .zip(right.par_chunks_exact(4))
         .for_each(|((out, left), right)| combine_rgba_pixel(left, right, out, anaglyph_matrix));
     #[cfg(not(feature = "parallel"))]
-    out.chunks_mut(4)
-        .zip(left.chunks_exact(4))
-        .zip(right.chunks_exact(4))
+    out.as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(left.as_chunks::<4>().0)
+        .zip(right.as_chunks::<4>().0)
         .for_each(|((out, left), right)| combine_rgba_pixel(left, right, out, anaglyph_matrix));
 
     out

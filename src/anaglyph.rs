@@ -187,9 +187,11 @@ fn blend_region(
         let out = &mut buffer[y * out_row..][..out_row];
 
         for ((out, left), right) in out
-            .chunks_exact_mut(3)
-            .zip(left_row.chunks_exact(3))
-            .zip(right_row.chunks_exact(3))
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(left_row.as_chunks::<3>().0)
+            .zip(right_row.as_chunks::<3>().0)
         {
             combine_slices(left, right, out, matrix);
         }

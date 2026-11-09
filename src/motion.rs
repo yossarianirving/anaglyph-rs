@@ -151,7 +151,7 @@ impl MotionEstimator {
                     let row = y as usize * self.src_width;
                     let start = (row + x0 as usize) * 3;
                     let end = (row + x1 as usize) * 3;
-                    for px in rgb[start..end].chunks_exact(3) {
+                    for px in rgb[start..end].as_chunks::<3>().0 {
                         // BT.601 luma with integer weights summing to 256.
                         sum += (77 * u32::from(px[0])
                             + 150 * u32::from(px[1])
@@ -177,7 +177,7 @@ impl MotionEstimator {
                     let row = y as usize * self.src_width;
                     let start = (row + x0 as usize) * 4;
                     let end = (row + x1 as usize) * 4;
-                    for px in rgba[start..end].chunks_exact(4) {
+                    for px in rgba[start..end].as_chunks::<4>().0 {
                         // BT.601 luma with integer weights summing to 256.
                         sum += (77 * u32::from(px[0])
                             + 150 * u32::from(px[1])
@@ -765,7 +765,7 @@ mod tests {
         for step in 0..6usize {
             let rgb = crop_rgb(&m, w + 20, step * 3, w, h);
             let mut rgba = Vec::with_capacity(w * h * 4);
-            for (i, px) in rgb.chunks_exact(3).enumerate() {
+            for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
                 // Reordered channels + garbage alpha: identical per-pixel
                 // R/G/B, so both paths must agree bit for bit.
                 rgba.extend_from_slice(&[px[2], px[0], px[1], (i * 37) as u8]);

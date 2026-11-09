@@ -453,7 +453,12 @@ impl GpuBlender {
 
         // Unpad stride 4 -> stride 3.
         let mut out = vec![0u8; (self.pixel_count as usize) * 3];
-        for (src, dst) in words.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+        for (src, dst) in words
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<3>().0.iter_mut())
+        {
             dst.copy_from_slice(&src[..3]);
         }
         Ok(out)

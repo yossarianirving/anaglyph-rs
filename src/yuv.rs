@@ -130,9 +130,10 @@ pub fn yuv420_to_rgba(
             ),
         };
         let out = &mut dst[oy * layout.width * 4..][..layout.width * 4];
-        for ox in 0..layout.width {
+        // `yrow` is exactly `layout.width` long, so iterating it matches 0..width.
+        for (ox, &y_in) in yrow.iter().enumerate() {
             // 10-bit fixed point, rounded; values then clamped to 0..=255.
-            let y = ((i32::from(yrow[ox]) - 16) * yb + 512) >> 10;
+            let y = ((i32::from(y_in) - 16) * yb + 512) >> 10;
             let cx = ((ox + parity) / 2) * cstep;
             let u = i32::from(urow[cx]) - 128;
             let v = i32::from(vrow[cx]) - 128;
@@ -198,7 +199,7 @@ mod tests {
             &layout_nv12(w, h),
             YuvStandard::Bt709
         ));
-        for px in dst.chunks_exact(4) {
+        for px in dst.as_chunks::<4>().0 {
             assert!((127..=131).contains(&px[0]), "{:?}", px);
             assert_eq!(px[0], px[1]);
             assert_eq!(px[1], px[2]);
@@ -215,7 +216,7 @@ mod tests {
         for p in planes[..w * h].iter_mut() {
             *p = 150;
         }
-        for chunk in planes[w * h..].chunks_exact_mut(2) {
+        for chunk in planes[w * h..].as_chunks_mut::<2>().0.iter_mut() {
             chunk[0] = 110;
             chunk[1] = 170;
         }
@@ -226,7 +227,7 @@ mod tests {
             &layout_nv12(w, h),
             YuvStandard::Bt709
         ));
-        for px in dst.chunks_exact(4) {
+        for px in dst.as_chunks::<4>().0 {
             assert!((229..=233).contains(&px[0]), "r {:?}", px);
             assert!((135..=139).contains(&px[1]), "g {:?}", px);
             assert!((116..=120).contains(&px[2]), "b {:?}", px);
@@ -236,7 +237,7 @@ mod tests {
         for p in planes[..w * h].iter_mut() {
             *p = 235;
         }
-        for chunk in planes[w * h..].chunks_exact_mut(2) {
+        for chunk in planes[w * h..].as_chunks_mut::<2>().0.iter_mut() {
             chunk[0] = 16;
             chunk[1] = 240;
         }
